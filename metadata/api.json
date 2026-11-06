@@ -45,6 +45,15 @@
   },
   {
     "service": "nonary.remote-session/1",
+    "method": "profile_targets",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.remote-session/1",
     "method": "profiles_get",
     "interface_major": 1,
     "interface_minor": 0,
