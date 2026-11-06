@@ -15,7 +15,7 @@ const layoutReply = (revision = 1, placements = {}) => ({ ok: true, revision, la
   physical_anchors: [{ id: 'display-main', label: 'Desktop' }], application_status: { state: 'pending' } });
 const profile = (patch = {}) => ({ id: 'app-0000000000000001', uuid: '11111111-2222-4333-8444-555555555555', name: 'Tablet',
   width: 1920, height: 1080, refresh_millihz: 60_000, hdr_enabled: false, scale: 100, target: { kind: 'owned' }, ...patch });
-const profilesReply = (revision = 1, profiles = [profile()]) => ({ ok: true, revision, profiles });
+const profilesReply = (revision = 1, profiles = [profile()]) => ({ ok: true, revision, profiles, next_cursor: null });
 
 test('layout validation rejects loops, duplicate primary, unsafe inventory choices and excessive payloads', () => {
   assert.throws(() => parseLayout({ version: 1, placements: { a: placement({ anchor_kind: 'client', anchor_id: 'b' }), b: placement({ anchor_kind: 'client', anchor_id: 'a' }) } }), /loop/);

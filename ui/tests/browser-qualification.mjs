@@ -103,10 +103,17 @@ try {
       }]};
       if(route!=='extensions/call')throw Error(route);
       if(payload.method==='profile_targets')return {result:{ok:true,targets:[
-        {selector:'display-main',label:'Desktop display',ready:true},
+        {selector:'display-main',label:'Desktop display',ready:true,mode:{width:1920,height:1080,refresh_millihz:60000,hdr_enabled:false}},
         {selector:'display-offline',label:'Disconnected display',ready:false,error:'Display is not active'}
       ]}};
-      if(payload.method==='profiles')return {result:{ok:true,revision:catalogRevision,profiles:profiles.map(profile=>({...profile}))}};
+      if(payload.method==='profiles'){
+        const cursor=payload.payload?.cursor;
+        if(cursor&&cursor.revision!==catalogRevision)return {result:{ok:false,code:'revision_conflict'}};
+        const remaining=profiles.filter(profile=>!cursor||profile.id>cursor.after).sort((left,right)=>left.id.localeCompare(right.id));
+        const rows=remaining.slice(0,1);
+        return {result:{ok:true,revision:catalogRevision,profiles:rows.map(profile=>({...profile})),
+          next_cursor:remaining.length>rows.length?{revision:catalogRevision,after:rows.at(-1).id}:null}};
+      }
       if(payload.method==='profile_upsert'){
         const request=payload.payload;profileWrites.push(request);
         if(request.expected_revision!==catalogRevision)return {result:{ok:false,code:'revision_conflict'}};
@@ -141,7 +148,7 @@ try {
     window.pages=new Amaterasu.ExtensionPages(api);await pages.discover();
     await pages.mountSlot('remote-session',document.querySelector('#settings'),'settings');
   })()`);
-  await until("document.querySelectorAll('.remote-session-settings input').length===15&&document.querySelector('.remote-session-profiles input[type=text]')?.value==='Tablet monitor'");
+  await until("document.querySelectorAll('.remote-session-settings input').length===16&&document.querySelector('.remote-session-profile-name input')?.value==='Tablet monitor'");
   assert.equal(await evaluate("document.querySelector('input[type=number]').value"), '16');
   assert.equal(await evaluate('pages.isDirty()'), false);
   assert.equal(await evaluate('document.documentElement.scrollWidth<=document.documentElement.clientWidth+1'), true);
@@ -178,10 +185,12 @@ try {
   shot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false},sessionId);
   writeFileSync(join(output,'remote-session-layout-desktop.png'),Buffer.from(shot.data,'base64'));
 
-  await evaluate("choose('Profile name','Drawing tablet HDR');choose('Display target','existing:display-main');choose('Monitor width (pixels)','2560');choose('Monitor height (pixels)','1600');choose('Monitor refresh rate (Hz)','120');press('Save monitor profile')");
+  await evaluate("choose('Profile name','Drawing tablet HDR');choose('Display target','existing:display-main');choose('Stream width (pixels)','2560');choose('Stream height (pixels)','1600');choose('Stream refresh rate (Hz)','120');press('Save monitor profile')");
   await until("!pages.isDirty()&&!pages.isBusy()&&document.querySelector('.remote-session-profiles .remote-session-notice').textContent.includes('saved and confirmed')");
   assert.equal(await evaluate("profileWrites[0].profile.target.selector==='display-main'&&profileWrites[0].profile.refresh_millihz===120000&&profileWrites[0].expected_revision===1"),true);
   assert.equal(await evaluate("[...document.querySelectorAll('.remote-session-profiles select option')].some(option=>option.value==='existing:display-offline')"),false,'unavailable displays cannot be chosen as new targets');
+  assert.match(await evaluate("document.querySelector('.remote-session-profiles').textContent"), /Display currently 1920 × 1080 at 60 Hz, SDR/);
+  assert.match(await evaluate("document.querySelector('.remote-session-profiles').textContent"), /HDR setting unchanged/);
   await evaluate("press('New monitor profile');choose('Profile name','Presentation display');press('Save monitor profile')");
   await until("profiles.length===2&&!pages.isBusy()&&!pages.isDirty()");
   await evaluate("press('Delete monitor profile')");
@@ -189,7 +198,7 @@ try {
   await evaluate("press('Delete this profile')");
   await until("profiles.length===1&&!pages.isBusy()&&!pages.isDirty()");
   assert.match(await evaluate("document.querySelector('.remote-session-profiles .remote-session-notice').textContent"), /Presentation display/);
-  assert.equal(await evaluate("document.querySelector('.remote-session-profiles input[type=text]').value"), 'Drawing tablet HDR');
+  assert.equal(await evaluate("document.querySelector('.remote-session-profile-name input').value"), 'Drawing tablet HDR');
 
   await command('Emulation.setDeviceMetricsOverride', {
     width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
@@ -202,13 +211,25 @@ try {
   shot = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, sessionId);
   writeFileSync(join(output, 'remote-session-profiles-mobile.png'), Buffer.from(shot.data, 'base64'));
 
+  await evaluate(`for(let index=3;index<=76;index++)profiles.push({
+    ...profiles[0],id:'app-'+index.toString(16).padStart(16,'0'),
+    uuid:index.toString(16).padStart(8,'0')+'-2222-4333-8444-555555555555',name:'Screen '+index.toString().padStart(4,'0')
+  });press('Refresh saved profiles');`);
+  await until("!pages.isBusy()&&document.querySelector('.remote-session-profiles').textContent.includes('75 saved in total')");
+  assert.equal(await evaluate("[...document.querySelectorAll('label')].find(label=>label.textContent==='Saved monitor profile')&&[...document.querySelectorAll('.remote-session-profiles select')][0].options.length<=33"),true,'local picker respects the shared SDK option bound');
+  await evaluate("press('Next profiles');choose('Saved monitor profile','profile:app-0000000000000040')");
+  assert.equal(await evaluate("document.querySelector('.remote-session-profile-name input').value"),'Screen 0064');
+  await evaluate("choose('Find a monitor profile','Screen 0070');choose('Saved monitor profile','profile:app-0000000000000046')");
+  assert.equal(await evaluate("document.querySelector('.remote-session-profile-name input').value"),'Screen 0070');
+  assert.equal(await evaluate('pages.isDirty()'),false);
+
   await evaluate(`(async()=>{
     pages.dispose();readOnly=true;
     pages=new Amaterasu.ExtensionPages(api);await pages.discover();
     await pages.mountSlot('remote-session',document.querySelector('#settings'),'settings');
   })()`);
-  await until("document.querySelectorAll('.remote-session-settings input').length===15");
-  assert.equal(await evaluate("[...document.querySelectorAll('.remote-session-settings input')].every(input=>input.disabled)"), true);
+  await until("document.querySelectorAll('.remote-session-settings input').length===16");
+  assert.equal(await evaluate("[...document.querySelectorAll('.remote-session-settings .plugin-control:not(.remote-session-profile-search) input')].every(input=>input.disabled)"), true);
   assert.equal(await evaluate("[...document.querySelectorAll('button')].find(button=>button.textContent==='Save remote session settings').disabled"), true);
   await evaluate('pages.dispose()');
   assert.equal(await evaluate("!document.querySelector('.remote-session-settings')&&!pages.isDirty()&&!pages.isBusy()"), true);

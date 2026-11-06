@@ -12,7 +12,14 @@ namespace RemoteSessionUi {
     target: MonitorTarget;
   }
   export interface ProfilesReply { ok: true; revision: number; profiles: MonitorProfile[] }
-  export interface ProfileTarget { selector: string; label: string; ready: boolean; error?: string }
+  export interface ProfileCursor { revision: number; after: string }
+  export interface ProfilesPage extends ProfilesReply { next_cursor: ProfileCursor | null }
+  export const profileReadBounds = Object.freeze({ pageSize: 32, pages: 100_000,
+    entries: 100_000, pageBytes: 12_000, totalBytes: 128 * 1024 * 1024 });
+  export interface ProfileTarget {
+    selector: string; label: string; ready: boolean; error?: string;
+    mode?: { width: number; height: number; refresh_millihz: number; hdr_enabled: boolean };
+  }
   export const profileScales = [-1, 0, 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500] as const;
 
   export function newProfile(): MonitorProfile {
@@ -22,7 +29,7 @@ namespace RemoteSessionUi {
   export function parseProfile(value: unknown, creating = false): MonitorProfile {
     const source = managementObject(value);
     const id = managementText(source.id, 24, creating);
-    if (id !== '' && !/^app-[0-9a-f]{16}$/u.test(id)) throw new Error('The profile identity is invalid.');
+    if (id !== '' && (!/^app-[0-9a-f]{16}$/u.test(id) || id === 'app-0000000000000000')) throw new Error('The profile identity is invalid.');
     const uuid = managementText(source.uuid, 36, creating);
     if (uuid !== '' && (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(uuid)
       || uuid === '00000000-0000-0000-0000-000000000000')) throw new Error('The profile identity is invalid.');
@@ -41,15 +48,67 @@ namespace RemoteSessionUi {
       refresh_millihz: managementInteger(source.refresh_millihz, 1000, 1_000_000, 'Refresh rate must be from 1 to 1000 Hz, with up to three decimal places.'),
       hdr_enabled: source.hdr_enabled, scale, target };
   }
-  export function parseProfilesReply(value: unknown): ProfilesReply {
+  function profilePageBytes(value: unknown): number {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new Error('The profile list response is invalid.');
+    return new TextEncoder().encode(serialized).length;
+  }
+  export function parseProfilesReply(value: unknown): ProfilesPage {
     const error = requestError(value);
     if (error) throw error;
     const source = managementObject(value);
-    if (source.ok !== true || !Array.isArray(source.profiles) || source.profiles.length > 16) throw new Error('The profile list is unavailable or exceeds this editor’s limit.');
+    if (source.ok !== true || !Array.isArray(source.profiles) || source.profiles.length > profileReadBounds.pageSize
+      || profilePageBytes(value) > profileReadBounds.pageBytes) throw new Error('The profile page is unavailable or exceeds its limit.');
+    if (!Object.hasOwn(source, 'next_cursor')) throw new Error('The profile page is missing its continuation field.');
     const profiles = source.profiles.map(profile => parseProfile(profile));
     if (new Set(profiles.map(profile => profile.id)).size !== profiles.length
       || new Set(profiles.map(profile => profile.uuid.toLowerCase())).size !== profiles.length) throw new Error('The profile list contains duplicate identities.');
-    return { ok: true, revision: managementRevision(source.revision), profiles };
+    const revision = managementRevision(source.revision);
+    let next_cursor: ProfileCursor | null = null;
+    if (source.next_cursor !== null) {
+      const cursor = managementObject(source.next_cursor);
+      const after = managementText(cursor.after, 20);
+      if (!/^app-[0-9a-f]{16}$/u.test(after) || after === 'app-0000000000000000' || managementRevision(cursor.revision) !== revision) {
+        throw new Error('The profile continuation cursor is invalid.');
+      }
+      next_cursor = { revision, after };
+    }
+    return { ok: true, revision, profiles, next_cursor };
+  }
+
+  /** Publish a complete revision; empty pages can advance over ordinary catalog rows. */
+  export async function readProfiles(api: SettingsApi, active: () => boolean = () => true): Promise<ProfilesReply> {
+    const profiles: MonitorProfile[] = [];
+    const identities = new Set<string>(), uuids = new Set<string>();
+    let cursor: ProfileCursor | null = null;
+    let revision: number | null = null;
+    let lastId: string | null = null;
+    let bytes = 0;
+    for (let pageNumber = 0; pageNumber < profileReadBounds.pages; pageNumber++) {
+      if (!active()) throw new Error('The profile editor is closed.');
+      const response = await api.call('profiles', { limit: profileReadBounds.pageSize, ...(cursor ? { cursor } : {}) });
+      if (!active()) throw new Error('The profile editor is closed.');
+      const page = parseProfilesReply(response);
+      if (revision !== null && page.revision !== revision) throw new Error('The profile catalog changed while loading. Refresh profiles to try again.');
+      revision = page.revision;
+      bytes += profilePageBytes(response);
+      if (profiles.length + page.profiles.length > profileReadBounds.entries || bytes > profileReadBounds.totalBytes) {
+        throw new Error('The complete profile catalog exceeds this editor’s capacity. No partial list was loaded.');
+      }
+      for (const profile of page.profiles) {
+        if (identities.has(profile.id) || uuids.has(profile.uuid.toLowerCase())) throw new Error('Profile pages contain duplicate identities.');
+        if (lastId !== null && profile.id <= lastId || cursor !== null && profile.id <= cursor.after) {
+          throw new Error('Profile pages are duplicated or out of order.');
+        }
+        identities.add(profile.id); uuids.add(profile.uuid.toLowerCase()); lastId = profile.id;
+        profiles.push(profile);
+      }
+      if (page.next_cursor === null) return { ok: true, revision, profiles };
+      if (cursor !== null && page.next_cursor.after <= cursor.after
+        || lastId !== null && page.next_cursor.after < lastId) throw new Error('The profile continuation cursor did not advance.');
+      cursor = page.next_cursor;
+    }
+    throw new Error('The profile catalog exceeds the pagination limit. No partial list was loaded.');
   }
   export function parseProfileTargets(value: unknown): ProfileTarget[] {
     const error = requestError(value);
@@ -59,7 +118,17 @@ namespace RemoteSessionUi {
     const targets = source.targets.map(value => {
       const target = managementObject(value);
       if (typeof target.ready !== 'boolean') throw new Error('The target readiness report is invalid.');
+      let mode: ProfileTarget['mode'];
+      if (target.mode !== undefined) {
+        const source = managementObject(target.mode);
+        if (typeof source.hdr_enabled !== 'boolean') throw new Error('The observed display mode is invalid.');
+        mode = { width: managementInteger(source.width, 1, 65_535, 'The observed display width is invalid.'),
+          height: managementInteger(source.height, 1, 65_535, 'The observed display height is invalid.'),
+          refresh_millihz: managementInteger(source.refresh_millihz, 1, 2_000_000, 'The observed display refresh rate is invalid.'),
+          hdr_enabled: source.hdr_enabled };
+      }
       return { selector: managementText(target.selector, 256), label: managementText(target.label, 160), ready: target.ready,
+        ...(mode === undefined ? {} : { mode }),
         ...(target.error === undefined ? {} : { error: managementText(target.error, 1024) }) };
     });
     if (new Set(targets.map(target => target.selector)).size !== targets.length) throw new Error('The target list contains duplicate identities.');
@@ -119,7 +188,7 @@ namespace RemoteSessionUi {
       const generation = ++this.generation;
       this.busy = true; this.error = false; this.message = 'Reading monitor profiles…'; this.changed();
       try {
-        const current = parseProfilesReply(await this.api.call('profiles'));
+        const current = await readProfiles(this.api, () => this.active(generation));
         if (!this.active(generation)) return;
         let draft = this.draft;
         let keep = !discardDraft && this.dirty();
@@ -188,7 +257,7 @@ namespace RemoteSessionUi {
         const confirmed = parseProfile(updated.profile), updatedRevision = managementRevision(updated.revision);
         if (updatedRevision <= revision || (requested.id !== '' && (confirmed.id !== requested.id || confirmed.uuid !== requested.uuid))
           || !profileEqual({ ...confirmed, id: requested.id, uuid: requested.uuid }, requested)) throw new Error('The profile update did not confirm the requested values.');
-        const readback = parseProfilesReply(await this.api.call('profiles'));
+        const readback = await readProfiles(this.api, () => this.active(generation));
         if (!this.active(generation)) return;
         const profile = readback.profiles.find(profile => profile.id === confirmed.id);
         if (readback.revision !== updatedRevision || !profile || !profileEqual(profile, confirmed)) throw new Error('The saved profile changed before readback.');
@@ -212,7 +281,7 @@ namespace RemoteSessionUi {
         if (rejection) throw rejection;
         const updated = managementObject(response), updatedRevision = managementRevision(updated.revision);
         if (updated.ok !== true || updatedRevision <= revision) throw new Error('The profile service did not confirm deletion.');
-        const readback = parseProfilesReply(await this.api.call('profiles'));
+        const readback = await readProfiles(this.api, () => this.active(generation));
         if (!this.active(generation)) return;
         if (readback.revision !== updatedRevision || readback.profiles.some(profile => profile.id === id)) throw new Error('The deleted profile is still present in readback.');
         this.saved = readback; this.original = readback.profiles[0] ?? null;
