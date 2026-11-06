@@ -2,12 +2,14 @@
 //!
 //! This provider uses the public virtual-display service. It never adopts an
 //! unrelated connector or treats request admission as readiness or retirement.
+mod composition;
 pub mod layout;
 
 use amaterasu_module_sdk::virtual_display::{Operation, SERVICE, VirtualDisplayLayout};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -78,6 +80,9 @@ pub struct MonitorSnapshot {
     pub client_id: String,
     pub generation: u64,
     pub ready: bool,
+    /// Existing authenticated source reservations remain valid after the role
+    /// disconnects, until their own capture lifetimes have retired.
+    pub source_ready: bool,
     pub retryable: bool,
     /// An exact provider-issued capture selector. No desktop fallback is valid.
     pub output: Option<String>,
@@ -96,6 +101,13 @@ enum Step {
     Create,
     Remove,
     VerifyRemove,
+    InspectSource,
+    CreateSource,
+    RemoveSource,
+    VerifySourceRemove,
+    CompositionSnapshot,
+    CompositionApply,
+    CompositionRelease,
 }
 
 struct Monitor {
@@ -104,12 +116,24 @@ struct Monitor {
     request: MonitorRequest,
     identity: String,
     reference: String,
+    source_reference: String,
+    source_reference_owned: bool,
+    source_reference_released: bool,
+    display_target: Option<String>,
+    display_payload: Option<Value>,
+    scope_reserved: bool,
+    composition_dirty: bool,
+    hdr_followup: bool,
+    layout_rules: layout::Layout,
+    known_targets: BTreeMap<String, String>,
+    physical_anchors: Vec<Value>,
     layout: Option<VirtualDisplayLayout>,
     step: Step,
     call: Option<Call>,
     serial: u64,
     next_poll: Instant,
     ready: bool,
+    source_ready: bool,
     output: Option<String>,
     error: Option<String>,
     release_requested: bool,
@@ -128,10 +152,13 @@ impl Monitor {
             client_id: self.client_id.clone(),
             generation: self.generation,
             ready: self.ready && !self.release_requested,
+            source_ready: self.source_ready,
             retryable: self.error.is_some() || (!self.ready && !self.reference_released),
-            output: self.ready.then(|| self.output.clone()).flatten(),
+            output: self.source_ready.then(|| self.output.clone()).flatten(),
             error: self.error.clone(),
-            cleanup_pending: self.release_requested && !self.reference_released,
+            cleanup_pending: self.release_requested
+                && (!self.reference_released
+                    || (self.captures.is_empty() && !self.source_reference_released)),
             reference_released: self.reference_released,
             parked: self.parked,
             native_retired: self.native_retired,
@@ -139,14 +166,21 @@ impl Monitor {
     }
 
     fn operation(&self) -> Operation {
+        let reference = if self.source_step() {
+            &self.source_reference
+        } else {
+            &self.reference
+        };
         match self.step {
-            Step::Inspect | Step::VerifyRemove => Operation::Status {
-                identity: Some(self.identity.clone()),
-                reference_id: Some(self.reference.clone()),
-            },
-            Step::Create => Operation::Create {
+            Step::Inspect | Step::VerifyRemove | Step::InspectSource | Step::VerifySourceRemove => {
+                Operation::Status {
+                    identity: Some(self.identity.clone()),
+                    reference_id: Some(reference.clone()),
+                }
+            }
+            Step::Create | Step::CreateSource => Operation::Create {
                 identity: self.identity.clone(),
-                reference_id: Some(self.reference.clone()),
+                reference_id: Some(reference.clone()),
                 name: "Remote Monitor".into(),
                 width: self.request.width,
                 height: self.request.height,
@@ -162,17 +196,34 @@ impl Monitor {
                 expected_topology_revision: None,
                 expected_topology_domain_id: None,
             },
-            Step::Remove => Operation::Remove {
+            Step::Remove | Step::RemoveSource => Operation::Remove {
                 identity: self.identity.clone(),
-                reference_id: Some(self.reference.clone()),
+                reference_id: Some(reference.clone()),
             },
+            Step::CompositionSnapshot | Step::CompositionApply | Step::CompositionRelease => {
+                unreachable!("display composition uses its selected service")
+            }
         }
+    }
+
+    fn source_step(&self) -> bool {
+        matches!(
+            self.step,
+            Step::InspectSource
+                | Step::CreateSource
+                | Step::RemoveSource
+                | Step::VerifySourceRemove
+        )
     }
 
     fn queue(&mut self, now: Instant) -> Result<(), String> {
         match self.step {
-            Step::Create => self.create_attempts = self.create_attempts.saturating_add(1),
-            Step::Remove => self.remove_attempts = self.remove_attempts.saturating_add(1),
+            Step::Create | Step::CreateSource => {
+                self.create_attempts = self.create_attempts.saturating_add(1)
+            }
+            Step::Remove | Step::RemoveSource => {
+                self.remove_attempts = self.remove_attempts.saturating_add(1)
+            }
             _ => {}
         }
         let serial = self
@@ -180,8 +231,25 @@ impl Monitor {
             .checked_add(1)
             .ok_or("monitor_operation_id_exhausted")?;
         self.serial = serial;
+        let (service, payload) = match self.step {
+            Step::CompositionSnapshot => (
+                amaterasu_module_sdk::display::SERVICE,
+                json!({"action":"snapshot"}),
+            ),
+            Step::CompositionApply | Step::CompositionRelease => (
+                amaterasu_module_sdk::display::SERVICE,
+                self.display_payload
+                    .clone()
+                    .ok_or("display_plan_unavailable")?,
+            ),
+            _ => (
+                SERVICE,
+                serde_json::to_value(self.operation()).map_err(|error| error.to_string())?,
+            ),
+        };
         self.call = Some(Call::new(
-            serde_json::to_value(self.operation()).map_err(|error| error.to_string())?,
+            service,
+            payload,
             format!(
                 "remote-monitor-{}-{}-{serial}",
                 self.identity, self.generation
@@ -205,9 +273,16 @@ impl Monitor {
         }
         self.release_requested = true;
         self.ready = false;
-        self.output = None;
-        if self.call.is_none() && self.captures.is_empty() {
-            self.schedule(Step::Remove, now, Duration::ZERO);
+        if self.call.is_none() {
+            self.schedule(
+                if self.reference_released {
+                    Step::InspectSource
+                } else {
+                    Step::Remove
+                },
+                now,
+                Duration::ZERO,
+            );
         }
     }
 
@@ -251,23 +326,35 @@ impl Monitor {
                 return;
             }
         };
-        if matches!(self.step, Step::Create | Step::Remove) {
+        if matches!(
+            self.step,
+            Step::Create | Step::Remove | Step::CreateSource | Step::RemoveSource
+        ) {
             // Native actors can still be creating/removing after admission.
             self.schedule(
-                if self.release_requested {
-                    Step::VerifyRemove
-                } else {
-                    Step::Inspect
+                match self.step {
+                    Step::RemoveSource => Step::VerifySourceRemove,
+                    Step::CreateSource if !self.release_requested => Step::InspectSource,
+                    _ if self.release_requested => Step::VerifyRemove,
+                    _ => Step::Inspect,
                 },
                 now,
                 Duration::ZERO,
             );
             return;
         }
-        self.inspect(payload, now);
+        if matches!(
+            self.step,
+            Step::CompositionSnapshot | Step::CompositionApply | Step::CompositionRelease
+        ) {
+            self.accept_composition(payload, now);
+        } else {
+            self.inspect(payload, now);
+        }
     }
 
     fn inspect(&mut self, payload: Value, now: Instant) {
+        let source_step = self.source_step();
         let Some(reference_owned) = payload["reference_owned"].as_bool() else {
             self.reject_status("invalid_monitor_status", now);
             return;
@@ -292,9 +379,41 @@ impl Monitor {
         }
         let monitor = matching.first().copied();
         if self.release_requested {
-            if reference_owned {
+            if source_step && reference_owned {
+                self.source_reference_owned = true;
+                if !self.reference_released {
+                    self.schedule(Step::Remove, now, Duration::ZERO);
+                } else if self.captures.is_empty() {
+                    self.schedule(
+                        if self.scope_reserved {
+                            Step::CompositionSnapshot
+                        } else {
+                            Step::RemoveSource
+                        },
+                        now,
+                        Duration::ZERO,
+                    );
+                } else if let Some(monitor) = monitor {
+                    self.accept_source_readiness(monitor, now);
+                } else {
+                    self.reject_status("source_reference_without_target", now);
+                }
+                return;
+            }
+            if !source_step && reference_owned {
                 self.schedule_remove(now);
                 return;
+            }
+            if !source_step {
+                self.reference_released = true;
+                if self.source_reference_owned {
+                    self.schedule(Step::InspectSource, now, Duration::ZERO);
+                    return;
+                }
+            } else {
+                self.source_reference_owned = false;
+                self.source_ready = false;
+                self.output = None;
             }
             if let Some(monitor) = monitor {
                 // Reference release does not establish native retirement while
@@ -304,7 +423,15 @@ impl Monitor {
                 if state == "cleanup_failed" {
                     self.schedule_remove(now);
                 } else {
-                    self.schedule(Step::VerifyRemove, now, RETRY_INTERVAL);
+                    self.schedule(
+                        if source_step {
+                            Step::VerifySourceRemove
+                        } else {
+                            Step::VerifyRemove
+                        },
+                        now,
+                        RETRY_INTERVAL,
+                    );
                 }
                 return;
             }
@@ -327,13 +454,17 @@ impl Monitor {
                 self.native_retired = true;
             }
             self.reference_released = true;
+            self.source_reference_released = true;
             self.error = None;
             return;
         }
         if !reference_owned {
             self.ready = false;
             self.output = None;
-            if monitor.is_some() {
+            if source_step && monitor.is_some() && self.create_attempts < MAX_EFFECT_ATTEMPTS {
+                self.source_reference_owned = false;
+                self.schedule(Step::CreateSource, now, Duration::ZERO);
+            } else if monitor.is_some() {
                 self.reject_status("monitor_reference_not_owned", now);
             } else if self.create_attempts >= MAX_EFFECT_ATTEMPTS {
                 self.error = Some("monitor_creation_requires_retry".into());
@@ -347,6 +478,115 @@ impl Monitor {
             self.reject_status("monitor_reference_without_target", now);
             return;
         };
+        if source_step {
+            self.source_reference_owned = true;
+            self.source_reference_released = false;
+        }
+        if monitor["state"] == "ready" {
+            if let Some(target) = monitor["ready"]["device_path"].as_str().filter(|target| {
+                !target.is_empty() && target.len() <= 4096 && !target.chars().any(char::is_control)
+            }) {
+                self.display_target = Some(target.into());
+            }
+            if !self.source_reference_owned {
+                self.schedule(Step::InspectSource, now, Duration::ZERO);
+                return;
+            }
+            if (!self.scope_reserved || self.composition_dirty)
+                && self.captures.is_empty()
+                && self.display_target.is_some()
+            {
+                self.schedule(Step::CompositionSnapshot, now, Duration::ZERO);
+                return;
+            }
+        }
+        if !self.accept_source_readiness(monitor, now) {
+            return;
+        }
+        if source_step {
+            self.ready = true;
+            self.schedule(Step::Inspect, now, HEALTH_INTERVAL);
+        } else if !self.source_reference_owned {
+            self.schedule(Step::InspectSource, now, Duration::ZERO);
+        } else {
+            self.ready = true;
+            self.schedule(Step::Inspect, now, HEALTH_INTERVAL);
+        }
+    }
+
+    fn accept_composition(&mut self, payload: Value, now: Instant) {
+        if self.step == Step::CompositionSnapshot {
+            let Some(target_id) = self.display_target.as_deref() else {
+                self.reject_status("monitor_target_unavailable", now);
+                return;
+            };
+            let operation_id = format!(
+                "remote-layout-{}-{}-{}",
+                self.identity, self.generation, self.serial
+            );
+            let release =
+                self.release_requested && self.reference_released && self.captures.is_empty();
+            let result = composition::prepare(
+                composition::TargetRequest {
+                    client: &self.client_id,
+                    identity: &self.identity,
+                    reference: &self.source_reference,
+                    target_id,
+                    width: self.request.width,
+                    height: self.request.height,
+                    refresh_millihz: self.request.refresh_millihz,
+                    hdr: self.request.hdr_enabled,
+                    layout: &self.layout_rules,
+                    known_targets: &self.known_targets,
+                },
+                payload,
+                &operation_id,
+                release,
+            );
+            match result {
+                Ok(composition) => {
+                    if !release {
+                        self.physical_anchors = composition.physical_anchors;
+                    }
+                    self.hdr_followup = composition.needs_hdr_followup;
+                    self.display_payload = Some(composition.payload);
+                    self.schedule(
+                        if release {
+                            Step::CompositionRelease
+                        } else {
+                            Step::CompositionApply
+                        },
+                        now,
+                        Duration::ZERO,
+                    );
+                }
+                Err(error) => self.reject_status(&error, now),
+            }
+            return;
+        }
+        if self.display_payload.as_ref().is_none_or(|plan| {
+            payload["operation_id"] != plan["operation_id"]
+                || payload["target_id"] != plan["target"]["id"]
+                    && self.step == Step::CompositionApply
+        }) {
+            self.reject_status("invalid_display_composition_result", now);
+            return;
+        }
+        match self.step {
+            Step::CompositionApply if payload["applied"] == true => {
+                self.scope_reserved = true;
+                self.composition_dirty = self.hdr_followup;
+                self.schedule(Step::InspectSource, now, Duration::ZERO);
+            }
+            Step::CompositionRelease if payload["released"] == true => {
+                self.scope_reserved = false;
+                self.schedule(Step::RemoveSource, now, Duration::ZERO);
+            }
+            _ => self.reject_status("display_composition_unconfirmed", now),
+        }
+    }
+
+    fn accept_source_readiness(&mut self, monitor: &Value, now: Instant) -> bool {
         let specification = &monitor["specification"];
         if specification["width"] != self.request.width
             || specification["height"] != self.request.height
@@ -355,31 +595,41 @@ impl Monitor {
             || specification["name"] != "Remote Monitor"
         {
             self.reject_status("monitor_specification_mismatch", now);
-            return;
+            return false;
         }
         if monitor["state"] != "ready" {
             self.reject_status(
                 monitor["error"].as_str().unwrap_or("monitor_not_ready"),
                 now,
             );
-            return;
+            return false;
         }
         if monitor["ready"]["active"] != true || !valid_output(&monitor["capture_output"]) {
             self.reject_status("exact_monitor_capture_unavailable", now);
-            return;
+            return false;
         }
-        self.ready = true;
+        self.source_ready = self.source_reference_owned;
         self.output = monitor["capture_output"].as_str().map(str::to_owned);
         self.error = None;
-        self.schedule(Step::Inspect, now, HEALTH_INTERVAL);
+        if self.release_requested {
+            self.schedule(Step::InspectSource, now, HEALTH_INTERVAL);
+        }
+        true
     }
 
     fn reject_status(&mut self, error: &str, now: Instant) {
         self.ready = false;
+        self.source_ready = false;
         self.output = None;
         self.error = Some(error.into());
         self.schedule(
-            if self.release_requested {
+            if self.source_step() {
+                if self.release_requested {
+                    Step::VerifySourceRemove
+                } else {
+                    Step::InspectSource
+                }
+            } else if self.release_requested {
                 Step::VerifyRemove
             } else {
                 Step::Inspect
@@ -406,6 +656,7 @@ pub struct MonitorManager {
     monitors: BTreeMap<String, Monitor>,
     generations: BTreeMap<String, u64>,
     shutting_down: bool,
+    layout: layout::Layout,
 }
 
 impl MonitorManager {
@@ -415,6 +666,7 @@ impl MonitorManager {
             monitors: BTreeMap::new(),
             generations: BTreeMap::new(),
             shutting_down: false,
+            layout: layout::Layout::default(),
         }
     }
 
@@ -429,11 +681,11 @@ impl MonitorManager {
             return Err("invalid_monitor_owner".into());
         }
         request.validate()?;
-        if self
-            .monitors
-            .get(client)
-            .is_some_and(|existing| existing.reference_released && generation > existing.generation)
-        {
+        if self.monitors.get(client).is_some_and(|existing| {
+            existing.reference_released
+                && existing.source_reference_released
+                && generation > existing.generation
+        }) {
             self.monitors.remove(client);
         }
         if let Some(existing) = self.monitors.get_mut(client) {
@@ -468,18 +720,31 @@ impl MonitorManager {
         }
         let identity = monitor_identity(client);
         let reference = format!("remote-monitor-{identity}-{generation}");
+        let source_reference = format!("remote-source-{identity}-{generation}");
         let monitor = Monitor {
             client_id: client.into(),
             generation,
             request,
             identity,
             reference,
+            source_reference,
+            source_reference_owned: false,
+            source_reference_released: false,
+            display_target: None,
+            display_payload: None,
+            scope_reserved: false,
+            composition_dirty: true,
+            hdr_followup: false,
+            layout_rules: self.layout.clone(),
+            known_targets: BTreeMap::new(),
+            physical_anchors: Vec::new(),
             layout: Some(VirtualDisplayLayout::Extended),
             step: Step::Inspect,
             call: None,
             serial: 0,
             next_poll: now,
             ready: false,
+            source_ready: false,
             output: None,
             error: None,
             release_requested: false,
@@ -555,9 +820,73 @@ impl MonitorManager {
         {
             monitor.captures.remove(transport_id);
             if monitor.release_requested && monitor.captures.is_empty() && monitor.call.is_none() {
-                monitor.schedule(Step::Remove, now, Duration::ZERO);
+                monitor.schedule(
+                    if monitor.reference_released {
+                        if monitor.scope_reserved {
+                            Step::CompositionSnapshot
+                        } else {
+                            Step::RemoveSource
+                        }
+                    } else {
+                        Step::Remove
+                    },
+                    now,
+                    Duration::ZERO,
+                );
             }
         }
+    }
+
+    pub fn set_layout(&mut self, layout: layout::Layout) -> Result<(), String> {
+        let bytes = serde_json::to_vec(&layout).map_err(|error| error.to_string())?;
+        self.layout = layout::Layout::decode(&bytes)?;
+        for monitor in self.monitors.values_mut() {
+            monitor.layout_rules = self.layout.clone();
+            monitor.composition_dirty = true;
+            if !monitor.release_requested && monitor.captures.is_empty() && monitor.call.is_none() {
+                monitor.ready = false;
+                monitor.next_poll = Instant::now();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn layout_status(&self) -> Value {
+        let monitors=self.monitors.values().filter(|monitor|!monitor.source_reference_released).map(|monitor|json!({
+            "client_id":monitor.client_id,
+            "state":if monitor.error.is_some(){"failed"}else if monitor.composition_dirty||!monitor.scope_reserved{"pending"}else{"applied"},
+            "error":monitor.error,
+        })).collect::<Vec<_>>();
+        let state = if monitors.iter().any(|monitor| monitor["state"] == "failed") {
+            "failed"
+        } else if monitors.iter().any(|monitor| monitor["state"] == "pending") {
+            "pending"
+        } else {
+            "applied"
+        };
+        json!({"state":state,"monitors":monitors})
+    }
+
+    pub fn physical_anchors(&self) -> Vec<Value> {
+        let mut anchors = BTreeMap::new();
+        for anchor in self
+            .monitors
+            .values()
+            .flat_map(|monitor| &monitor.physical_anchors)
+        {
+            if let Some(id) = anchor["id"].as_str() {
+                anchors.insert(id.to_owned(), anchor.clone());
+            }
+        }
+        anchors.into_values().collect()
+    }
+
+    pub fn apply_settings(&mut self, settings: MonitorSettings) {
+        self.settings = settings;
+    }
+
+    pub fn update_settings(&mut self, settings: MonitorSettings) {
+        self.apply_settings(settings);
     }
 
     pub fn stream_end(&mut self, client: &str, generation: u64, now: Instant) {
@@ -588,13 +917,13 @@ impl MonitorManager {
     pub fn has_pending_cleanup(&self) -> bool {
         self.monitors
             .values()
-            .any(|monitor| monitor.release_requested && !monitor.reference_released)
+            .any(|monitor| monitor.release_requested && !monitor.source_reference_released)
     }
 
     pub fn active_count(&self) -> usize {
         self.monitors
             .values()
-            .filter(|monitor| !monitor.reference_released)
+            .filter(|monitor| !monitor.source_reference_released)
             .count()
     }
 
@@ -603,17 +932,25 @@ impl MonitorManager {
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<()> {
+        let known_targets = self
+            .monitors
+            .values()
+            .filter_map(|monitor| {
+                monitor
+                    .display_target
+                    .as_ref()
+                    .map(|target| (target.clone(), monitor.client_id.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
         for monitor in self.monitors.values_mut() {
-            if monitor.reference_released || monitor.effect_stalled || now < monitor.next_poll {
-                continue;
-            }
-            if monitor.release_requested && !monitor.captures.is_empty() && monitor.call.is_none() {
+            monitor.known_targets = known_targets.clone();
+            if monitor.source_reference_released
+                || monitor.effect_stalled
+                || now < monitor.next_poll
+            {
                 continue;
             }
             if monitor.call.is_none() {
-                if monitor.release_requested && monitor.step != Step::VerifyRemove {
-                    monitor.step = Step::Remove;
-                }
                 monitor.queue(now)?;
             }
             let outcome = monitor
@@ -639,10 +976,10 @@ struct Call {
 }
 
 impl Call {
-    fn new(payload: Value, operation_id: String, now: Instant) -> Self {
+    fn new(service: &str, payload: Value, operation_id: String, now: Instant) -> Self {
         Self {
             command: Command::Request {
-                service: SERVICE.into(),
+                service: service.into(),
                 payload,
                 timeout_ms: REQUEST_TIMEOUT.as_millis() as u64,
                 operation_id,

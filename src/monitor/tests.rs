@@ -7,7 +7,7 @@ struct Provider {
     operations: BTreeMap<String, u64>,
     next: u64,
     specification: Option<Value>,
-    reference: Option<String>,
+    references: BTreeSet<String>,
     state: &'static str,
     capture_output: Option<String>,
     parked: bool,
@@ -27,7 +27,7 @@ impl Default for Provider {
             operations: BTreeMap::new(),
             next: 0,
             specification: None,
-            reference: None,
+            references: BTreeSet::new(),
             state: "creating",
             capture_output: Some("kwin:Virtual-7".into()),
             parked: false,
@@ -51,14 +51,18 @@ impl Provider {
                 operation_id,
                 ..
             } => {
-                assert_eq!(service, SERVICE);
                 if let Some(id) = self.operations.get(&operation_id) {
                     return Ok(Response::Accepted { id: *id });
                 }
                 self.next += 1;
                 let id = self.next;
                 self.operations.insert(operation_id, id);
-                let result = self.operate(&payload);
+                let result = if service == amaterasu_module_sdk::display::SERVICE {
+                    self.display(&payload)
+                } else {
+                    assert_eq!(service, SERVICE);
+                    self.operate(&payload)
+                };
                 self.calls.insert(id, result);
                 self.observed.push(payload);
                 if std::mem::take(&mut self.lose_admission) {
@@ -100,25 +104,31 @@ impl Provider {
         }
         match payload["action"].as_str().unwrap() {
             "create" => {
+                let first = self.specification.is_none();
                 self.specification = Some(json!({
                     "identity":payload["identity"],"width":payload["width"],"height":payload["height"],
                     "refresh_millihz":payload["refresh_millihz"],"hdr_enabled":payload["hdr_enabled"],"name":payload["name"]
                 }));
-                self.reference = payload["reference_id"].as_str().map(str::to_owned);
-                self.state = "creating";
+                self.references
+                    .insert(payload["reference_id"].as_str().unwrap().into());
+                if first {
+                    self.state = "creating";
+                }
                 json!({"ok":true,"reference_owned":true,"monitor":{"state":"creating"}})
             }
             "remove" => {
-                self.reference = None;
-                self.remove_requested = true;
-                if self.specification.is_some() {
+                self.references
+                    .remove(payload["reference_id"].as_str().unwrap());
+                self.remove_requested = self.references.is_empty();
+                if self.remove_requested && self.specification.is_some() {
                     self.state = "removing";
                 }
                 json!({"ok":true,"reference_owned":false,"monitor":{"state":"removing"}})
             }
             "status" => {
-                let owned = self.reference.as_deref() == payload["reference_id"].as_str()
-                    && self.reference.is_some();
+                let owned = self
+                    .references
+                    .contains(payload["reference_id"].as_str().unwrap());
                 let monitors = self.specification.as_ref().map(|specification| json!({
                     "specification":specification,"state":self.state,"error":null,
                     "capture_output":self.capture_output,"ready":{"device_path":"Virtual-7","active":self.state=="ready"}
@@ -131,6 +141,27 @@ impl Provider {
                 json!({"ok":true,"driver":"libvirtualdisplay","reference_owned":owned,"monitors":monitors,"parked":self.parked,"parked_outputs":parked_outputs})
             }
             _ => panic!("unknown provider operation"),
+        }
+    }
+
+    fn display(&mut self, payload: &Value) -> Value {
+        match payload["action"].as_str().unwrap() {
+            "snapshot" => {
+                let mut displays = vec![
+                    json!({"id":"physical-one","width":1920,"height":1080,"refresh":{"numerator":60000,"denominator":1000},"x":0,"y":0,"rotation":"identity","hdr_enabled":false}),
+                ];
+                if let Some(spec) = &self.specification {
+                    displays.push(json!({"id":"Virtual-7","width":spec["width"],"height":spec["height"],"refresh":{"numerator":spec["refresh_millihz"],"denominator":1000},"x":1920,"y":0,"rotation":"identity","hdr_enabled":spec["hdr_enabled"]}));
+                }
+                json!({"ok":true,"topology_revision":"0123456789abcdef0123456789abcdef","configuration":{"displays":displays}})
+            }
+            "scoped_apply" => {
+                json!({"ok":true,"applied":true,"operation_id":payload["operation_id"],"target_id":payload["target"]["id"]})
+            }
+            "scoped_release" => {
+                json!({"ok":true,"released":true,"native_removed":false,"operation_id":payload["operation_id"],"target_id":"Virtual-7"})
+            }
+            _ => panic!("unknown display operation"),
         }
     }
 }
@@ -147,7 +178,7 @@ fn request() -> MonitorRequest {
 }
 
 fn tick(manager: &mut MonitorManager, provider: &mut Provider, now: Instant) {
-    for _ in 0..16 {
+    for _ in 0..24 {
         manager
             .tick(now, &mut |command| provider.send(command))
             .unwrap();
@@ -210,7 +241,7 @@ fn a_lost_admission_reuses_the_exact_operation_and_releases_every_result() {
             .iter()
             .filter(|operation| operation["action"] == "create")
             .count(),
-        1
+        2
     );
     assert!(provider.calls.is_empty());
     assert_eq!(provider.released, provider.observed.len());
@@ -399,7 +430,8 @@ fn failed_native_cleanup_uses_a_bounded_window_until_an_explicit_retry() {
     manager
         .release("alice", 3, now + Duration::from_secs(21))
         .unwrap();
-    tick(&mut manager, &mut provider, now + Duration::from_secs(21));
+    tick(&mut manager, &mut provider, now + Duration::from_secs(22));
+    tick(&mut manager, &mut provider, now + Duration::from_secs(23));
     assert_eq!(
         provider
             .observed
@@ -407,5 +439,77 @@ fn failed_native_cleanup_uses_a_bounded_window_until_an_explicit_retry() {
             .filter(|operation| operation["action"] == "remove")
             .count(),
         attempts + 1
+    );
+}
+
+#[test]
+fn monitor_role_can_disconnect_while_an_independent_game_keeps_the_source() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider::default();
+    ready(&mut manager, &mut provider, now);
+    assert_eq!(provider.references.len(), 2);
+    manager.capture_started("alice", 3, "game-source").unwrap();
+    manager.release("alice", 3, now).unwrap();
+    tick(&mut manager, &mut provider, now);
+    let snapshot = manager.snapshot("alice").unwrap();
+    assert!(snapshot.reference_released);
+    assert!(!snapshot.cleanup_pending);
+    assert!(!snapshot.ready);
+    assert!(snapshot.source_ready);
+    assert_eq!(snapshot.output.as_deref(), Some("kwin:Virtual-7"));
+    assert!(!snapshot.native_retired);
+    assert_eq!(provider.references.len(), 1);
+    assert!(!provider.remove_requested);
+    assert!(manager.begin("alice", 4, request(), now).is_err());
+    manager.capture_stopped("alice", 3, "game-source", now);
+    tick(&mut manager, &mut provider, now);
+    assert!(provider.remove_requested);
+    assert!(manager.snapshot("alice").unwrap().cleanup_pending);
+    provider.specification = None;
+    tick(&mut manager, &mut provider, now + Duration::from_secs(1));
+    assert!(manager.snapshot("alice").unwrap().native_retired);
+}
+
+#[test]
+fn persisted_layout_waits_for_capture_retirement_then_uses_scoped_composition() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider::default();
+    ready(&mut manager, &mut provider, now);
+    manager.capture_started("alice", 3, "game").unwrap();
+    let anchors = manager.physical_anchors();
+    let saved=layout::Layout::decode(serde_json::to_vec(&json!({"version":1,"placements":{"alice":{
+        "anchor_kind":"physical","anchor_id":anchors[0]["id"],"edge":"left","alignment":"center","gap_px":20
+    }}})).unwrap().as_slice()).unwrap();
+    manager.set_layout(saved).unwrap();
+    let before = provider
+        .observed
+        .iter()
+        .filter(|operation| operation["action"] == "scoped_apply")
+        .count();
+    tick(&mut manager, &mut provider, now + Duration::from_secs(2));
+    assert_eq!(manager.layout_status()["state"], "pending");
+    assert_eq!(
+        provider
+            .observed
+            .iter()
+            .filter(|operation| operation["action"] == "scoped_apply")
+            .count(),
+        before
+    );
+    manager.capture_stopped("alice", 3, "game", now + Duration::from_secs(2));
+    tick(&mut manager, &mut provider, now + Duration::from_secs(3));
+    assert_eq!(manager.layout_status()["state"], "applied");
+    let operation = provider
+        .observed
+        .iter()
+        .rev()
+        .find(|operation| operation["action"] == "scoped_apply")
+        .unwrap();
+    assert_eq!(operation["target"]["x"], -1940);
+    assert_eq!(
+        operation["reference_id"],
+        manager.monitors["alice"].source_reference
     );
 }
