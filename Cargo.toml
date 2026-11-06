@@ -1,0 +1,21 @@
+[package]
+name = "amaterasu-remote-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+amaterasu-state = { path = "../state", features = ["test-support"] }
+
+[lints]
+workspace = true
