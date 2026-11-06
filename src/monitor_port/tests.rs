@@ -147,6 +147,8 @@ fn existing_targets_preflight_the_desktop_route_without_inventing_a_selector() {
     let mut port = MonitorPort::new(&ProductSettings::default(), "existing");
     port.authorize_sources(BTreeMap::from([("client".into(), true)]), true);
     let mut existing = owner();
+    existing.mode.width = 64;
+    existing.mode.height = 48;
     existing.profile_settings =
         json!({"monitor_target":{"kind":"existing","selector":"opaque-target"}});
     assert!(port.begin(&existing, now).is_err());
@@ -159,6 +161,136 @@ fn existing_targets_preflight_the_desktop_route_without_inventing_a_selector() {
     assert_eq!(request.source_class, SourceClass::DesktopOutput);
     assert_eq!(request.route, None);
     assert_eq!(port.manager.active_count(), 0);
+    port.begin(&existing, now).unwrap();
+    assert_eq!(port.manager.active_count(), 1);
+}
+
+#[derive(Default)]
+struct AbsentMonitorProviders {
+    next_request: u64,
+    results: BTreeMap<u64, Value>,
+    actions: Vec<(String, Value)>,
+}
+
+impl AbsentMonitorProviders {
+    fn send(&mut self, command: Command) -> ModuleResult<Response> {
+        match command {
+            Command::Request {
+                service, payload, ..
+            } => {
+                self.actions.push((service.clone(), payload.clone()));
+                let response = match (service.as_str(), payload["action"].as_str()) {
+                    ("amaterasu.virtual-display/1", Some("remove")) => {
+                        json!({"ok":true,"removed":true,"identity":payload["identity"]})
+                    }
+                    ("amaterasu.virtual-display/1", Some("status")) => {
+                        json!({"ok":true,"reference_owned":false,"monitors":[]})
+                    }
+                    ("amaterasu.display/1", Some("scoped_status")) => {
+                        json!({"ok":true,"identity":payload["identity"],"reference_id":payload["reference_id"],"reference_owned":false,"operation_id":null,"pending":false})
+                    }
+                    unexpected => panic!("cleanup attempted a new source effect: {unexpected:?}"),
+                };
+                self.next_request += 1;
+                self.results.insert(self.next_request, response);
+                Ok(Response::Accepted {
+                    id: self.next_request,
+                })
+            }
+            Command::TakeResult { request } => Ok(Response::Result {
+                payload: self.results.get(&request).unwrap().clone(),
+            }),
+            Command::ReleaseResult { request } => {
+                assert!(self.results.remove(&request).is_some());
+                Ok(Response::Ok)
+            }
+            unexpected => panic!("unexpected cleanup command: {unexpected:?}"),
+        }
+    }
+}
+
+fn drain_absent_monitor(port: &mut MonitorPort, owner: &RetainedOwner, now: Instant) {
+    let mut providers = AbsentMonitorProviders::default();
+    for step in 0..40 {
+        let current = now + Duration::from_millis(step * 250);
+        // Policy synchronization repeats while the independently observed
+        // provider result is pending. Repeated cleanup cannot reset progress.
+        port.begin(owner, current).unwrap();
+        port.release(&owner.client_id, owner.generation, current)
+            .unwrap();
+        port.tick(current, &mut |command| providers.send(command))
+            .unwrap();
+        if port
+            .snapshot(&owner.client_id)
+            .unwrap()
+            .source_reference_released
+        {
+            break;
+        }
+    }
+    let status = port.snapshot(&owner.client_id).unwrap();
+    assert!(status.reference_released);
+    assert!(status.source_reference_released);
+    assert!(!status.cleanup_pending);
+    assert!(!status.ready);
+    assert!(!status.source_ready);
+    assert!(providers.results.is_empty());
+    let references = providers
+        .actions
+        .iter()
+        .filter(|(service, payload)| {
+            service == "amaterasu.virtual-display/1" && payload["action"] == "status"
+        })
+        .map(|(_, payload)| payload["reference_id"].as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        references.len(),
+        2,
+        "role and source require separate absence proofs"
+    );
+    assert!(
+        providers
+            .actions
+            .iter()
+            .any(|(service, payload)| service == "amaterasu.display/1"
+                && payload["action"] == "scoped_status")
+    );
+}
+
+#[test]
+fn persisted_invalid_monitor_mode_retires_without_authority_or_capture_preflight() {
+    let now = Instant::now();
+    let mut port = MonitorPort::new(&ProductSettings::default(), "persisted-cleanup");
+    let mut retiring = owner();
+    retiring.mode.width = 64;
+    retiring.mode.height = 48;
+    retiring.release_requested = true;
+    port.begin(&retiring, now).unwrap();
+    assert!(!port.snapshot("client").unwrap().reference_released);
+    assert!(!port.snapshot("client").unwrap().source_reference_released);
+    assert!(port.proofs.is_empty());
+    drain_absent_monitor(&mut port, &retiring, now);
+}
+
+#[test]
+fn rejected_small_monitor_can_start_exact_cleanup_from_its_frozen_proof() {
+    let now = Instant::now();
+    let mut port = MonitorPort::new(&ProductSettings::default(), "rejected-cleanup");
+    port.authorize_sources(BTreeMap::from([("client".into(), true)]), true);
+    let mut rejected = owner();
+    rejected.mode.width = 64;
+    rejected.mode.height = 48;
+    assert!(port.begin(&rejected, now).is_err());
+    let mut video = Video::new(false);
+    for _ in 0..3 {
+        port.tick(now, &mut |command| video.send(command)).unwrap();
+    }
+    assert!(video.released);
+    assert!(port.manager.snapshot("client").is_none());
+    port.release("client", 1, now).unwrap();
+    assert!(!port.snapshot("client").unwrap().source_reference_released);
+    rejected.release_requested = true;
+    drain_absent_monitor(&mut port, &rejected, now);
 }
 
 #[test]

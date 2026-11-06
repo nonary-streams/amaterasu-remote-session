@@ -241,11 +241,20 @@ impl Monitors for MonitorPort {
         if owner.role != Role::Monitor {
             return Err("input_session_cannot_acquire_monitor".into());
         }
-        // Cleanup never depends on a working capture backend. The actor has no
-        // native effect until policy synchronously queues its persisted release.
-        if !owner.release_requested {
-            self.preflight(owner, now)?;
+        // A persisted release must reconcile its exact references even when
+        // the saved mode no longer satisfies admission or capture constraints.
+        if owner.release_requested {
+            return self
+                .manager
+                .begin_cleanup(
+                    &owner.client_id,
+                    owner.generation,
+                    monitor_request(owner),
+                    now,
+                )
+                .map(|_| ());
         }
+        self.preflight(owner, now)?;
         self.manager
             .begin(
                 &owner.client_id,
@@ -316,7 +325,7 @@ impl Monitors for MonitorPort {
             && let Some(proof) = self.proofs.get(&(client.to_owned(), generation))
         {
             self.manager
-                .begin(client, generation, monitor_request(&proof.owner), now)?;
+                .begin_cleanup(client, generation, monitor_request(&proof.owner), now)?;
         }
         self.manager.release(client, generation, now)
     }
