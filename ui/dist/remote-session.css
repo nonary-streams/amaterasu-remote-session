@@ -1,0 +1,18 @@
+.remote-session-settings { display: grid; gap: 1rem; max-width: 52rem; }
+.remote-session-settings h2 { margin: 0; }
+.remote-session-settings > p { margin: 0; line-height: 1.5; }
+.remote-session-settings .plugin-ui-card { margin: 0; }
+.remote-session-settings .remote-session-fields { display: grid; gap: 1.25rem; }
+.remote-session-settings .remote-session-fields .plugin-control { width: 100%; min-width: 0; margin: 0; }
+.remote-session-settings .plugin-toggle { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .35rem 1rem; }
+.remote-session-settings .plugin-toggle > label { grid-column: 1; grid-row: 1; text-align: left; }
+.remote-session-settings .plugin-toggle > input[type="checkbox"] { grid-column: 2; grid-row: 1; margin: 0; }
+.remote-session-settings .plugin-toggle > small { grid-column: 1 / -1; text-align: left; }
+.remote-session-settings .remote-session-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .65rem; }
+.remote-session-settings .remote-session-actions .plugin-action { width: auto; margin: 0; }
+.remote-session-settings .remote-session-notice { min-height: 1.5em; }
+.remote-session-settings .remote-session-notice[data-error="true"] { color: var(--danger, #d73a49); }
+.remote-session-settings .remote-session-readonly { opacity: .8; }
+@media (max-width: 520px) {
+  .remote-session-settings .remote-session-actions .plugin-action { width: 100%; }
+}

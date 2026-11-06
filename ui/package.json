@@ -1,0 +1,13 @@
+{
+  "name": "amaterasu-remote-session-ui",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs --check && node --test tests/*.test.mjs",
+    "qualify:browser": "npm run build && node tests/browser-qualification.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

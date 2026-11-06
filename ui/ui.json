@@ -1,0 +1,25 @@
+{
+  "placements": ["settings"],
+  "methods": [
+    {
+      "alias": "preferences",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "settings_get",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.read",
+      "min_role": "viewer"
+    },
+    {
+      "alias": "preferences_update",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "settings_update",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.write",
+      "min_role": "administrator"
+    }
+  ]
+}
