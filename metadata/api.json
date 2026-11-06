@@ -57,7 +57,7 @@
     "method": "profiles_get",
     "interface_major": 1,
     "interface_minor": 0,
-    "request": {"required": {}, "optional": {}, "allow_extra": false},
+    "request": {"required": {}, "optional": {"cursor": "object", "limit": "integer"}, "allow_extra": false},
     "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
     "privilege": "user"
   },
