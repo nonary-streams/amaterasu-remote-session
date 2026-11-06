@@ -3,6 +3,8 @@
 //! Profiles remain ordinary marked catalog identities. No second store can
 //! diverge from the entries presented to Moonlight, and accepted monitor owners
 //! retain their previously frozen properties after a profile edit or deletion.
+//! Reads return one revision-bound page; callers follow its public continuation
+//! instead of asking this provider to retain an entire catalog snapshot.
 use amaterasu_module_sdk::application_library::{CatalogProfileRequest, LibraryCursor};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::Deserialize;
@@ -12,18 +14,20 @@ use std::collections::{BTreeSet, VecDeque};
 const CATALOG: &str = "amaterasu.catalog/1";
 const DISPLAY: &str = "amaterasu.display/1";
 const MAX_PENDING: usize = 32;
-const MAX_PROFILES: usize = 16;
-const MAX_PAGES: usize = 1_024;
+const DEFAULT_PAGE_LIMIT: usize = 16;
 const PAGE_QUERY: &str = "remote_monitor_profiles";
 
 #[path = "profiles/model.rs"]
 mod model;
-pub use model::{Profile, ProfileTarget};
+pub use model::{Profile, ProfileCursor, ProfileTarget};
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
-    ProfilesGet {},
+    ProfilesGet {
+        cursor: Option<ProfileCursor>,
+        limit: Option<usize>,
+    },
     ProfileUpsert {
         profile: Profile,
         expected_revision: u64,
@@ -36,12 +40,9 @@ enum Operation {
 }
 
 enum Purpose {
-    List {
-        revision: Option<u64>,
-        after: Option<String>,
-        profiles: Vec<Profile>,
-        pages: usize,
-        write: Option<(Profile, u64)>,
+    Page {
+        cursor: Option<ProfileCursor>,
+        limit: usize,
     },
     Upsert {
         desired: Profile,
@@ -117,17 +118,21 @@ impl ProfileManager {
         let operation: Operation = serde_json::from_value(payload)
             .map_err(|_| failure("invalid_request", "request does not match the profile API"))?;
         let (purpose, service, payload) = match operation {
-            Operation::ProfilesGet {} => (
-                Purpose::List {
-                    revision: None,
-                    after: None,
-                    profiles: Vec::new(),
-                    pages: 0,
-                    write: None,
-                },
-                CATALOG,
-                list_payload(None),
-            ),
+            Operation::ProfilesGet { cursor, limit } => {
+                let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+                if !(1..=32).contains(&limit)
+                    || cursor
+                        .as_ref()
+                        .is_some_and(|cursor| !valid_id(&cursor.after))
+                {
+                    return Err(failure(
+                        "invalid_request",
+                        "profile page limit or cursor is invalid",
+                    ));
+                }
+                let payload = list_payload(cursor.as_ref(), limit);
+                (Purpose::Page { cursor, limit }, CATALOG, payload)
+            }
             Operation::ProfileUpsert {
                 mut profile,
                 expected_revision,
@@ -147,16 +152,19 @@ impl ProfileManager {
                         "existing profile UUID is required",
                     ));
                 }
+                let payload = serde_json::to_value(CatalogProfileRequest::ProfileUpsert {
+                    id: profile.id.clone(),
+                    entry: profile.entry(),
+                    expected_revision,
+                })
+                .map_err(|_| invalid_catalog())?;
                 (
-                    Purpose::List {
-                        revision: None,
-                        after: None,
-                        profiles: Vec::new(),
-                        pages: 0,
-                        write: Some((profile, expected_revision)),
+                    Purpose::Upsert {
+                        desired: profile,
+                        expected_revision,
                     },
                     CATALOG,
-                    list_payload(None),
+                    payload,
                 )
             }
             Operation::ProfileDelete {
@@ -390,128 +398,99 @@ impl ProfileManager {
                     json!({"ok":true,"revision":payload["revision"],"profile":profile}),
                 ))
             }
-            Purpose::List {
-                revision,
-                after,
-                profiles,
-                pages,
-                write,
-            } => {
-                let page_revision = payload["revision"].as_u64().ok_or_else(invalid_catalog)?;
-                if revision.is_some_and(|revision| revision != page_revision) {
-                    return Err(failure(
-                        "revision_conflict",
-                        "catalog changed while listing profiles",
-                    ));
-                }
-                *revision = Some(page_revision);
-                *pages += 1;
-                if *pages > MAX_PAGES {
-                    return Err(failure(
-                        "profile_scan_exhausted",
-                        "catalog profile scan exceeds its bound",
-                    ));
-                }
-                let entries = payload["entries"]
-                    .as_array()
-                    .filter(|entries| entries.len() <= 32)
-                    .ok_or_else(invalid_catalog)?;
-                let mut last = after.clone();
-                for row in entries {
-                    let profile = Profile::from_identity(row.clone())?;
-                    if last.as_ref().is_some_and(|last| profile.id <= *last) {
-                        return Err(invalid_catalog());
-                    }
-                    last = Some(profile.id.clone());
-                    profiles.push(profile);
-                    if profiles.len() > MAX_PROFILES {
-                        return Err(failure(
-                            "profile_capacity_exhausted",
-                            "at most 16 managed monitor profiles are supported",
-                        ));
-                    }
-                }
-                let cursor = payload.get("next_cursor").ok_or_else(invalid_catalog)?;
-                if !cursor.is_null() {
-                    let cursor: LibraryCursor =
-                        serde_json::from_value(cursor.clone()).map_err(|_| invalid_catalog())?;
-                    if cursor.revision != page_revision
-                        || cursor.query != PAGE_QUERY
-                        || !valid_id(&cursor.after)
-                        || after.as_ref().is_some_and(|after| cursor.after <= *after)
-                        || last.as_ref().is_some_and(|last| cursor.after < *last)
-                    {
-                        return Err(invalid_catalog());
-                    }
-                    *after = Some(cursor.after.clone());
-                    pending.payload = list_payload(Some(cursor));
-                } else if let Some((profile, expected_revision)) = write.take() {
-                    if expected_revision != page_revision {
-                        return Err(
-                            json!({"ok":false,"code":"revision_conflict","current_revision":page_revision}),
-                        );
-                    }
-                    if profile.id.is_empty() {
-                        if profiles.len() == MAX_PROFILES {
-                            return Err(failure(
-                                "profile_capacity_exhausted",
-                                "at most 16 managed monitor profiles are supported",
-                            ));
-                        }
-                    } else if profiles
-                        .iter()
-                        .find(|existing| existing.id == profile.id)
-                        .is_none_or(|existing| existing.uuid != profile.uuid)
-                    {
-                        return Err(failure(
-                            "profile_identity_mismatch",
-                            "profile changed or no longer exists",
-                        ));
-                    }
-                    pending.payload = serde_json::to_value(CatalogProfileRequest::ProfileUpsert {
-                        id: profile.id.clone(),
-                        entry: profile.entry(),
-                        expected_revision,
-                    })
-                    .map_err(|_| invalid_catalog())?;
-                    pending.purpose = Purpose::Upsert {
-                        desired: profile,
-                        expected_revision,
-                    };
-                } else {
-                    if profiles
-                        .iter()
-                        .map(|profile| profile.uuid.as_str())
-                        .collect::<BTreeSet<_>>()
-                        .len()
-                        != profiles.len()
-                    {
-                        return Err(invalid_catalog());
-                    }
-                    let response = json!({"ok":true,"revision":page_revision,"profiles":profiles});
-                    if !serde_json::to_vec(&response).is_ok_and(|bytes| bytes.len() <= 12_000) {
-                        return Err(failure(
-                            "profile_reply_too_large",
-                            "profile reply exceeds its transport bound",
-                        ));
-                    }
-                    return Ok(Some(response));
-                }
-                pending.operation_id = self.next_operation()?;
-                pending.call = Call::Submit { attempted: false };
-                Ok(None)
-            }
+            Purpose::Page { cursor, limit } => Ok(Some(project_profile_page(
+                payload,
+                cursor.as_ref(),
+                *limit,
+            )?)),
         }
     }
 }
 
-fn list_payload(cursor: Option<LibraryCursor>) -> Value {
+fn list_payload(cursor: Option<&ProfileCursor>, limit: usize) -> Value {
     serde_json::to_value(CatalogProfileRequest::ProfileList {
-        cursor,
-        limit: Some(32),
+        cursor: cursor.map(|cursor| LibraryCursor {
+            revision: cursor.revision,
+            after: cursor.after.clone(),
+            query: PAGE_QUERY.into(),
+        }),
+        limit: Some(limit),
     })
-    .expect("profile list serializes")
+    .expect("profile page serializes")
 }
+
+/// Validate one complete catalog page before exposing its public projection.
+/// The continuation uses only catalog IDs; no private cursor state is retained.
+fn project_profile_page(
+    payload: Value,
+    requested: Option<&ProfileCursor>,
+    limit: usize,
+) -> Result<Value, Value> {
+    let revision = payload["revision"].as_u64().ok_or_else(invalid_catalog)?;
+    if requested.is_some_and(|cursor| cursor.revision != revision) {
+        return Err(failure(
+            "revision_conflict",
+            "catalog changed while listing profiles",
+        ));
+    }
+    let entries = payload["entries"]
+        .as_array()
+        .filter(|entries| entries.len() <= limit)
+        .ok_or_else(invalid_catalog)?;
+    let mut after = requested.map(|cursor| cursor.after.as_str());
+    let mut profiles = Vec::new();
+    let mut uuids = BTreeSet::new();
+    for row in entries {
+        let id = row["id"].as_str().ok_or_else(invalid_catalog)?;
+        if after.is_some_and(|after| id <= after) {
+            return Err(invalid_catalog());
+        }
+        let profile = Profile::from_identity(row.clone())?;
+        if !uuids.insert(profile.uuid.clone()) {
+            return Err(invalid_catalog());
+        }
+        after = Some(id);
+        profiles.push(profile);
+    }
+    let raw_cursor = payload.get("next_cursor").ok_or_else(invalid_catalog)?;
+    let mut next_cursor = if raw_cursor.is_null() {
+        None
+    } else {
+        let cursor: LibraryCursor =
+            serde_json::from_value(raw_cursor.clone()).map_err(|_| invalid_catalog())?;
+        if cursor.revision != revision
+            || cursor.query != PAGE_QUERY
+            || !valid_id(&cursor.after)
+            || requested.is_some_and(|requested| cursor.after <= requested.after)
+            || after.is_some_and(|last| cursor.after.as_str() < last)
+        {
+            return Err(invalid_catalog());
+        }
+        Some(ProfileCursor {
+            revision,
+            after: cursor.after,
+        })
+    };
+    loop {
+        let response =
+            json!({"ok":true,"revision":revision,"profiles":profiles,"next_cursor":next_cursor});
+        if serde_json::to_vec(&response).is_ok_and(|bytes| bytes.len() <= 12_000) {
+            return Ok(response);
+        }
+        profiles.pop();
+        let Some(last) = profiles.last() else {
+            return Err(failure(
+                "profile_reply_too_large",
+                "a profile exceeds its transport bound",
+            ));
+        };
+        next_cursor = Some(ProfileCursor {
+            revision,
+            after: last.id.clone(),
+        });
+    }
+}
+
 fn printable(value: &str, limit: usize) -> bool {
     !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
 }

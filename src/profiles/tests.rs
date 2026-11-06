@@ -113,7 +113,6 @@ fn create_returns_catalog_id_uuid_and_revision_only_after_result_retirement() {
     let mut provider = |service: &str, payload: &Value| {
         assert_eq!(service, CATALOG);
         match payload["action"].as_str().unwrap() {
-            "profile_list" => page(7, Vec::new(), Value::Null),
             "profile_upsert" => {
                 assert_eq!(payload["id"], "");
                 assert_eq!(payload["expected_revision"], 7);
@@ -127,7 +126,7 @@ fn create_returns_catalog_id_uuid_and_revision_only_after_result_retirement() {
             other => panic!("unexpected action {other}"),
         }
     };
-    for _ in 0..5 {
+    for _ in 0..2 {
         host.tick(&mut manager, &mut provider);
     }
     host.fail_release = true;
@@ -158,28 +157,24 @@ fn create_returns_catalog_id_uuid_and_revision_only_after_result_retirement() {
 fn listing_rejects_revision_change_without_publishing_partial_profiles() {
     let mut manager = ProfileManager::new("startup");
     manager
-        .handle(10, "amaterasu.management", json!({"action":"profiles_get"}))
+        .handle(
+            10,
+            "amaterasu.management",
+            json!({"action":"profiles_get","cursor":{"revision":3,"after":"app-0000000000000001"}}),
+        )
         .unwrap();
     let mut host = Host {
         parent_live: true,
         ..Default::default()
     };
-    let mut calls = 0;
     let mut existing = profile();
     existing.uuid = UUID.into();
-    let mut provider = |_: &str, _: &Value| {
-        calls += 1;
-        if calls == 1 {
-            page(
-                3,
-                vec![row(&existing, "app-0000000000000001")],
-                json!({"revision":3,"after":"app-0000000000000001","query":PAGE_QUERY}),
-            )
-        } else {
-            page(4, vec![row(&existing, "app-0000000000000002")], Value::Null)
-        }
+    let mut provider = |_: &str, payload: &Value| {
+        assert_eq!(payload["cursor"]["revision"], 3);
+        assert_eq!(payload["cursor"]["query"], PAGE_QUERY);
+        page(4, vec![row(&existing, "app-0000000000000002")], Value::Null)
     };
-    for _ in 0..8 {
+    for _ in 0..3 {
         host.tick(&mut manager, &mut provider);
     }
     let (_, response) = manager.take_completion().unwrap();
@@ -188,7 +183,7 @@ fn listing_rejects_revision_change_without_publishing_partial_profiles() {
 }
 
 #[test]
-fn mutation_preflight_fences_stale_revision_and_immutable_uuid() {
+fn mutation_delegation_preserves_catalog_cas_and_immutable_identity_failures() {
     for (expected_revision, uuid, expected_code) in [
         (3, UUID, "revision_conflict"),
         (
@@ -202,21 +197,22 @@ fn mutation_preflight_fences_stale_revision_and_immutable_uuid() {
         desired.id = "app-0000000000000001".into();
         desired.uuid = uuid.into();
         manager.handle(11,"amaterasu.management",json!({"action":"profile_upsert","profile":desired,"expected_revision":expected_revision})).unwrap();
-        let mut stored = profile();
-        stored.uuid = UUID.into();
         let mut host = Host {
             parent_live: true,
             ..Default::default()
         };
         let mut provider = |_: &str, payload: &Value| {
-            assert_eq!(payload["action"], "profile_list");
-            page(4, vec![row(&stored, "app-0000000000000001")], Value::Null)
+            assert_eq!(payload["action"], "profile_upsert");
+            assert_eq!(payload["expected_revision"], expected_revision);
+            assert_eq!(payload["entry"]["uuid"], uuid);
+            json!({"ok":false,"error":{"code":expected_code,"message":"catalog rejected stale mutation","current_revision":4}})
         };
-        for _ in 0..4 {
+        for _ in 0..3 {
             host.tick(&mut manager, &mut provider);
         }
         let (_, response) = manager.take_completion().unwrap();
         assert_eq!(response["code"], expected_code);
+        assert_eq!(response["current_revision"], 4);
         assert_eq!(
             host.commands
                 .iter()
@@ -343,7 +339,7 @@ fn lost_admission_retries_exact_payload_and_quiesce_waits_for_release() {
 }
 
 #[test]
-fn cancelled_parent_cannot_start_a_following_catalog_mutation() {
+fn cancelled_parent_cannot_start_a_catalog_mutation() {
     let mut manager = ProfileManager::new("startup");
     manager
         .handle(
@@ -353,27 +349,151 @@ fn cancelled_parent_cannot_start_a_following_catalog_mutation() {
         )
         .unwrap();
     let mut host = Host {
-        parent_live: true,
+        parent_live: false,
         ..Default::default()
     };
-    let mut provider = |_: &str, payload: &Value| {
-        assert_eq!(payload["action"], "profile_list");
-        page(0, Vec::new(), Value::Null)
-    };
+    let mut provider = |_: &str, _: &Value| panic!("cancelled parent reached provider");
     for _ in 0..3 {
         host.tick(&mut manager, &mut provider);
     }
-    host.parent_live = false;
-    for _ in 0..4 {
-        host.tick(&mut manager, &mut provider);
-    }
     assert!(manager.active.is_none());
-    assert_eq!(
-        host.commands
+    assert!(
+        !host
+            .commands
             .iter()
-            .filter(|command| matches!(command, Command::Request { .. }))
-            .count(),
-        1
+            .any(|command| matches!(command, Command::Request { .. }))
     );
     assert!(manager.take_completion().is_none());
+}
+
+#[test]
+fn more_than_sixteen_profiles_are_read_across_consistent_bounded_pages() {
+    let mut manager = ProfileManager::new("startup");
+    let mut host = Host {
+        parent_live: true,
+        ..Default::default()
+    };
+    let records: Vec<_> = (1..=45)
+        .map(|number| {
+            let mut item = profile();
+            item.uuid = format!("f920e4f5-e140-45e4-a737-{number:012x}");
+            row(&item, &format!("app-{number:016x}"))
+        })
+        .collect();
+    let mut provider = |_: &str, payload: &Value| {
+        assert_eq!(payload["action"], "profile_list");
+        assert_eq!(payload["limit"], 16);
+        let after = payload["cursor"]["after"].as_str().unwrap_or("");
+        let available: Vec<_> = records
+            .iter()
+            .filter(|row| row["id"].as_str().unwrap() > after)
+            .collect();
+        let entries: Vec<_> = available
+            .iter()
+            .take(16)
+            .map(|row| (*row).clone())
+            .collect();
+        let cursor = if available.len() > entries.len() {
+            json!({"revision":9,"after":entries.last().unwrap()["id"],"query":PAGE_QUERY})
+        } else {
+            Value::Null
+        };
+        page(9, entries, cursor)
+    };
+    let mut cursor = Value::Null;
+    let mut collected = Vec::new();
+    let mut request = 0;
+    loop {
+        request += 1;
+        let mut payload = json!({"action":"profiles_get"});
+        if !cursor.is_null() {
+            payload["cursor"] = cursor;
+        }
+        manager
+            .handle(request, "amaterasu.management", payload)
+            .unwrap();
+        for _ in 0..3 {
+            host.tick(&mut manager, &mut provider);
+        }
+        let (_, response) = manager.take_completion().unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["revision"], 9);
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 12000);
+        collected.extend(
+            response["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|profile| profile["id"].as_str().unwrap().to_owned()),
+        );
+        cursor = response["next_cursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+        assert!(request < 10);
+    }
+    assert_eq!(collected.len(), 45);
+    assert_eq!(request, 3);
+    assert!(collected.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn page_bounds_retain_continuation_instead_of_truncating_expanded_profiles() {
+    let entries:Vec<_>=(1..=28).map(|number|json!({"id":format!("app-{number:016x}"),"uuid":format!("f920e4f5-e140-45e4-a737-{number:012x}"),"title":"x".repeat(160),"aliases":[],"visible":true,"monitor_profile":true,"properties":{"monitor_target":{"kind":"existing","selector":"s".repeat(64)}}})).collect();
+    let response = project_profile_page(page(3, entries, Value::Null), None, 32).unwrap();
+    assert!(serde_json::to_vec(&response).unwrap().len() <= 12000);
+    let profiles = response["profiles"].as_array().unwrap();
+    assert!(!profiles.is_empty());
+    assert!(profiles.len() < 28);
+    assert_eq!(
+        response["next_cursor"]["after"],
+        profiles.last().unwrap()["id"]
+    );
+    assert_eq!(response["next_cursor"]["revision"], 3);
+}
+
+#[test]
+fn empty_sparse_pages_advance_and_invalid_limits_or_cursors_are_rejected() {
+    let cursor = ProfileCursor {
+        revision: 3,
+        after: "app-0000000000000001".into(),
+    };
+    let response = project_profile_page(
+        page(
+            3,
+            Vec::new(),
+            json!({"revision":3,"after":"app-0000000000000100","query":PAGE_QUERY}),
+        ),
+        Some(&cursor),
+        16,
+    )
+    .unwrap();
+    assert_eq!(response["profiles"], json!([]));
+    assert_eq!(response["next_cursor"]["after"], "app-0000000000000100");
+    let mut manager = ProfileManager::new("startup");
+    for extra in [
+        json!({"limit":0}),
+        json!({"limit":33}),
+        json!({"cursor":{"revision":3,"after":"invalid"}}),
+        json!({"cursor":{"revision":3,"after":"app-0000000000000001","owner":"foreign"}}),
+    ] {
+        let mut payload = json!({"action":"profiles_get"});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(manager.handle(1, "amaterasu.management", payload).is_err());
+    }
+    assert!(
+        project_profile_page(
+            page(
+                3,
+                Vec::new(),
+                json!({"revision":3,"after":cursor.after,"query":PAGE_QUERY})
+            ),
+            Some(&cursor),
+            16
+        )
+        .is_err()
+    );
 }

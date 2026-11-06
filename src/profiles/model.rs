@@ -4,6 +4,14 @@ use amaterasu_module_sdk::application_library::LibraryIdentityEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Public continuation bound to one exact catalog revision and ordered ID.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileCursor {
+    pub revision: u64,
+    pub after: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProfileTarget {
