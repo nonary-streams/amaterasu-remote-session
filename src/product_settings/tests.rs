@@ -435,3 +435,51 @@ fn shutdown_recovers_unknown_admission_and_retires_it_before_reporting_quiescenc
     assert_eq!(configuration.submissions.len(), 2);
     assert_eq!(configuration.submissions[0], configuration.submissions[1]);
 }
+
+#[test]
+fn saved_layout_and_preferences_share_one_cas_revision_and_survive_ordinary_updates() {
+    let mut store = ProductSettingsStore::new("layout", ProductSettings::default());
+    let mut configuration = Configuration {
+        management_active: true,
+        ..Default::default()
+    };
+    configuration.load(&mut store);
+    let mut layout_settings = store.settings().0.clone();
+    layout_settings.remote_monitor_layout = json!({"version":1,"placements":{"client":{"anchor_kind":"automatic","anchor_id":"","edge":"right","alignment":"center","gap_px":0}}});
+    store.begin_update(88, 0, layout_settings.clone()).unwrap();
+    assert_eq!(configuration.finish_update(&mut store)["ok"], true);
+
+    let mut preferences = store.settings().0.clone();
+    preferences.remote_monitor_mute_audio = true;
+    store.begin_update(88, 1, preferences.clone()).unwrap();
+    assert_eq!(configuration.finish_update(&mut store)["ok"], true);
+    assert_eq!(
+        store.settings().0.remote_monitor_layout,
+        layout_settings.remote_monitor_layout
+    );
+    assert_eq!(store.settings().1, 2);
+    assert_eq!(
+        store.begin_update(88, 1, layout_settings).unwrap_err()["code"],
+        "revision_conflict"
+    );
+
+    let mut restarted = ProductSettingsStore::new("layout-restart", ProductSettings::default());
+    configuration.load(&mut restarted);
+    assert_eq!(restarted.settings(), (&preferences, 2));
+}
+
+#[test]
+fn legacy_saved_product_document_loads_without_a_layout_migration_write() {
+    let mut values = serde_json::to_value(ProductSettings::default()).unwrap();
+    values
+        .as_object_mut()
+        .unwrap()
+        .remove("remote_monitor_layout");
+    let document = json!({"ok":true,"found":true,"version":1,"revision":7,"values":values});
+    let (settings, revision) = parse_document(&document, &ProductSettings::default()).unwrap();
+    assert_eq!(revision, 7);
+    assert_eq!(
+        settings.remote_monitor_layout,
+        json!({"version":1,"placements":{}})
+    );
+}
