@@ -20,5 +20,62 @@
     },
     "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
     "privilege": "user"
+  },
+  {
+    "service": "nonary.remote-session/1",
+    "method": "layout_get",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.remote-session/1",
+    "method": "layout_update",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {"layout": "object", "expected_revision": "integer"},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.remote-session/1",
+    "method": "profiles_get",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.remote-session/1",
+    "method": "profile_upsert",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {"profile": "object", "expected_revision": "integer"},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.remote-session/1",
+    "method": "profile_delete",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {"id": "string", "expected_revision": "integer"},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
   }
 ]
