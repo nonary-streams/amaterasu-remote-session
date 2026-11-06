@@ -4,8 +4,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 import ts from 'typescript';
 
-const context = vm.createContext({ Error });
-vm.runInContext(ts.transpile(readFileSync('src/settings.ts', 'utf8'), {
+const context = vm.createContext({ Error, TextEncoder });
+vm.runInContext(ts.transpile(['src/layout_model.ts','src/settings.ts'].map(file=>readFileSync(file,'utf8')).join('\n'), {
   target: ts.ScriptTarget.ES2022,
 }), context);
 const { SettingsEditor, parseReply, parseSettings } = context.RemoteSessionUi;
@@ -17,7 +17,7 @@ const settings = () => ({
   remote_monitor_disconnect_on_client_disconnect: false,
   remote_monitor_terminate_on_first_request: false,
   remote_monitor_confirm_app_replacement: true,
-  max_clients: 16,
+  max_clients: 16, remote_monitor_layout: { version: 1, placements: {} },
 });
 const reply = (revision = 4, values = settings()) => ({ ok: true, revision, settings: values });
 const deferred = () => {
@@ -211,4 +211,24 @@ test('revision exhaustion cannot submit an imprecise expected revision', async (
   await editor.save();
   assert.equal(writes, 0);
   assert.match(editor.message, /next settings revision/);
+});
+
+test('preferences preserve the separately edited monitor layout and rebase its current revision', async () => {
+  let current = reply(4, { ...settings(), remote_monitor_layout: { version: 1, placements: {
+    'client-a': { anchor_kind: 'physical', anchor_id: 'display-main', edge: 'right', alignment: 'start', gap_px: 12, primary: false, preserve: false, automatic_fallback: false },
+  } } });
+  let sent;
+  const editor = new SettingsEditor({ async call(alias, payload) {
+    if (alias === 'preferences') return current;
+    sent = ordinary(payload);
+    current = reply(current.revision + 1, ordinary(payload.settings)); return current;
+  } }, () => {});
+  await editor.refresh(); editor.edit('show_remote_input', false);
+  current = { ...current, revision: 5, settings: { ...current.settings, remote_monitor_layout: {
+    version: 1, placements: { 'client-a': { ...current.settings.remote_monitor_layout.placements['client-a'], gap_px: 24 } },
+  } } };
+  await editor.refresh(); await editor.save();
+  assert.equal(sent.expected_revision, 5);
+  assert.equal(sent.settings.remote_monitor_layout.placements['client-a'].gap_px, 24);
+  assert.equal(sent.settings.show_remote_input, false);
 });

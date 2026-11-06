@@ -88,12 +88,13 @@ try {
   ].map(file => readFileSync(join(sdkRoot, 'frontend/src', file), 'utf8')).join('\n');
   await evaluate(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }));
   await evaluate(`(async()=>{
-    window.preferencesRevision=1; window.readOnly=false; window.writes=[];
+    window.preferencesRevision=1; window.readOnly=false; window.writes=[];window.layoutWrites=[];window.profileWrites=[];window.catalogRevision=1;window.profileSequence=1;
     window.preferences={
       show_remote_input:true,show_remote_monitor:true,remote_monitor_mute_audio:false,
       remote_monitor_disconnect_on_stream_end:false,remote_monitor_disconnect_on_client_disconnect:false,
-      remote_monitor_terminate_on_first_request:false,remote_monitor_confirm_app_replacement:true,max_clients:16
+      remote_monitor_terminate_on_first_request:false,remote_monitor_confirm_app_replacement:true,max_clients:16,remote_monitor_layout:{version:1,placements:{}}
     };
+    window.profiles=[{id:'app-0000000000000001',uuid:'11111111-2222-4333-8444-555555555555',name:'Tablet monitor',width:1920,height:1080,refresh_millihz:60000,hdr_enabled:false,scale:100,target:{kind:'owned'}}];
     window.api={allows:()=>true,post:async(route,payload)=>{
       if(route==='extensions/list')return {extensions:[{
         id:'remote-session',name:'Remote sessions',sdk_version:1,digest:'a'.repeat(64),
@@ -101,8 +102,37 @@ try {
         methods:${JSON.stringify(configuration.methods)}.filter(method=>!readOnly||!method.scope.endsWith('.write'))
       }]};
       if(route!=='extensions/call')throw Error(route);
+      if(payload.method==='profile_targets')return {result:{ok:true,targets:[
+        {selector:'display-main',label:'Desktop display',ready:true},
+        {selector:'display-offline',label:'Disconnected display',ready:false,error:'Display is not active'}
+      ]}};
+      if(payload.method==='profiles')return {result:{ok:true,revision:catalogRevision,profiles:profiles.map(profile=>({...profile}))}};
+      if(payload.method==='profile_upsert'){
+        const request=payload.payload;profileWrites.push(request);
+        if(request.expected_revision!==catalogRevision)return {result:{ok:false,code:'revision_conflict'}};
+        const profile={...request.profile};
+        if(!profile.id){profileSequence++;profile.id='app-'+profileSequence.toString(16).padStart(16,'0');profile.uuid=profileSequence.toString().repeat(8)+'-2222-4333-8444-555555555555';}
+        profiles=profiles.filter(existing=>existing.id!==profile.id);profiles.push(profile);catalogRevision++;
+        return {result:{ok:true,revision:catalogRevision,profile}};
+      }
+      if(payload.method==='profile_delete'){
+        if(payload.payload.expected_revision!==catalogRevision)return {result:{ok:false,code:'revision_conflict'}};
+        profiles=profiles.filter(profile=>profile.id!==payload.payload.id);catalogRevision++;
+        return {result:{ok:true,revision:catalogRevision}};
+      }
+      if(payload.method==='layout_update'){
+        layoutWrites.push(payload.payload);
+        if(payload.payload.expected_revision!==preferencesRevision)return {result:{ok:false,code:'revision_conflict'}};
+        preferences.remote_monitor_layout=payload.payload.layout;preferencesRevision++;
+      }
+      if(payload.method==='layout'||payload.method==='layout_update')return {result:{ok:true,revision:preferencesRevision,
+        layout:preferences.remote_monitor_layout,
+        clients:[{id:'client-a',label:'Drawing tablet',ready:true,state:'ready'},{id:'client-b',label:'Laptop',ready:false,state:'retained'}],
+        physical_anchors:[{id:'display-main',label:'Desktop display'}],application_status:{state:'pending'}
+      }};
       if(payload.method==='preferences_update'){
         writes.push(payload.payload);
+        if(payload.payload.expected_revision!==preferencesRevision)return {result:{ok:false,code:'revision_conflict'}};
         if(window.deferSave)await new Promise(resolve=>window.releaseSave=resolve);
         Object.assign(preferences,payload.payload.settings); preferencesRevision++;
       }
@@ -111,7 +141,7 @@ try {
     window.pages=new Amaterasu.ExtensionPages(api);await pages.discover();
     await pages.mountSlot('remote-session',document.querySelector('#settings'),'settings');
   })()`);
-  await until("document.querySelectorAll('.remote-session-settings input').length===8");
+  await until("document.querySelectorAll('.remote-session-settings input').length===15&&document.querySelector('.remote-session-profiles input[type=text]')?.value==='Tablet monitor'");
   assert.equal(await evaluate("document.querySelector('input[type=number]').value"), '16');
   assert.equal(await evaluate('pages.isDirty()'), false);
   assert.equal(await evaluate('document.documentElement.scrollWidth<=document.documentElement.clientWidth+1'), true);
@@ -123,31 +153,66 @@ try {
   await evaluate("window.deferSave=true;[...document.querySelectorAll('button')].find(button=>button.textContent==='Save remote session settings').click()");
   await until('!!window.releaseSave');
   assert.equal(await evaluate('pages.isBusy()'), true);
-  assert.equal(await evaluate("[...document.querySelectorAll('.remote-session-settings input')].every(input=>input.disabled)"), true);
+  assert.equal(await evaluate("[...document.querySelectorAll('.remote-session-settings > .plugin-ui-card:not(.remote-session-layout):not(.remote-session-profiles) input')].every(input=>input.disabled)"), true);
   await evaluate('releaseSave()');
   await until('!pages.isBusy()&&!pages.isDirty()');
   assert.equal(await evaluate('writes.length===1&&writes[0].expected_revision===1&&writes[0].settings.max_clients===8'), true);
   assert.equal(await evaluate("Object.keys(writes[0].settings).some(key=>['enabled','allowed_principals'].includes(key))"), false);
   assert.match(await evaluate("document.querySelector('.remote-session-notice').textContent"), /saved and confirmed/);
 
+  await evaluate(`window.choose=(label,value)=>{
+    const node=[...document.querySelectorAll('label')].find(node=>node.textContent===label);
+    const field=document.getElementById(node.htmlFor);field.value=value;
+    field.dispatchEvent(new Event(field.tagName==='SELECT'?'change':'input',{bubbles:true}));
+  };window.press=label=>[...document.querySelectorAll('button')].find(button=>button.textContent===label).click();`);
+  await evaluate("choose('Position','relative');choose('Place monitor','below');choose('Gap between monitors (pixels)','24');press('Save monitor positions')");
+  await until("document.querySelector('.remote-session-layout .remote-session-notice').textContent.includes('another editor')");
+  assert.equal(await evaluate('pages.isDirty()'), true, 'shared preferences revision conflicts keep position edits');
+  await evaluate("press('Refresh saved positions')");
+  await until("!pages.isBusy()&&document.querySelector('.remote-session-layout .remote-session-notice').textContent.includes('unsaved changes are kept')");
+  await evaluate("press('Save monitor positions')");
+  await until("!pages.isDirty()&&!pages.isBusy()&&document.querySelector('.remote-session-layout .remote-session-notice').textContent.includes('saved and confirmed')");
+  assert.equal(await evaluate("layoutWrites.at(-1).expected_revision===2&&layoutWrites.at(-1).layout.placements['client-a'].gap_px===24&&layoutWrites.at(-1).layout.placements['client-a'].edge==='below'"), true);
+  assert.match(await evaluate("document.querySelector('.remote-session-layout').textContent"), /Placement status: pending/);
+  await evaluate("document.querySelector('.remote-session-layout').scrollIntoView({block:'start'})");
+  shot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false},sessionId);
+  writeFileSync(join(output,'remote-session-layout-desktop.png'),Buffer.from(shot.data,'base64'));
+
+  await evaluate("choose('Profile name','Drawing tablet HDR');choose('Display target','existing:display-main');choose('Monitor width (pixels)','2560');choose('Monitor height (pixels)','1600');choose('Monitor refresh rate (Hz)','120');press('Save monitor profile')");
+  await until("!pages.isDirty()&&!pages.isBusy()&&document.querySelector('.remote-session-profiles .remote-session-notice').textContent.includes('saved and confirmed')");
+  assert.equal(await evaluate("profileWrites[0].profile.target.selector==='display-main'&&profileWrites[0].profile.refresh_millihz===120000&&profileWrites[0].expected_revision===1"),true);
+  assert.equal(await evaluate("[...document.querySelectorAll('.remote-session-profiles select option')].some(option=>option.value==='existing:display-offline')"),false,'unavailable displays cannot be chosen as new targets');
+  await evaluate("press('New monitor profile');choose('Profile name','Presentation display');press('Save monitor profile')");
+  await until("profiles.length===2&&!pages.isBusy()&&!pages.isDirty()");
+  await evaluate("press('Delete monitor profile')");
+  assert.equal(await evaluate("document.querySelector('dialog')?.open"),true);
+  await evaluate("press('Delete this profile')");
+  await until("profiles.length===1&&!pages.isBusy()&&!pages.isDirty()");
+  assert.match(await evaluate("document.querySelector('.remote-session-profiles .remote-session-notice').textContent"), /Presentation display/);
+  assert.equal(await evaluate("document.querySelector('.remote-session-profiles input[type=text]').value"), 'Drawing tablet HDR');
+
   await command('Emulation.setDeviceMetricsOverride', {
     width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
   }, sessionId);
   assert.equal(await evaluate('document.documentElement.scrollWidth<=document.documentElement.clientWidth+1'), true, 'mobile settings do not overflow');
+  await evaluate("window.scrollTo(0,0)");
   shot = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true }, sessionId);
   writeFileSync(join(output, 'remote-session-mobile.png'), Buffer.from(shot.data, 'base64'));
+  await evaluate("document.querySelector('.remote-session-profiles').scrollIntoView({block:'start'})");
+  shot = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, sessionId);
+  writeFileSync(join(output, 'remote-session-profiles-mobile.png'), Buffer.from(shot.data, 'base64'));
 
   await evaluate(`(async()=>{
     pages.dispose();readOnly=true;
     pages=new Amaterasu.ExtensionPages(api);await pages.discover();
     await pages.mountSlot('remote-session',document.querySelector('#settings'),'settings');
   })()`);
-  await until("document.querySelectorAll('.remote-session-settings input').length===8");
+  await until("document.querySelectorAll('.remote-session-settings input').length===15");
   assert.equal(await evaluate("[...document.querySelectorAll('.remote-session-settings input')].every(input=>input.disabled)"), true);
   assert.equal(await evaluate("[...document.querySelectorAll('button')].find(button=>button.textContent==='Save remote session settings').disabled"), true);
   await evaluate('pages.dispose()');
   assert.equal(await evaluate("!document.querySelector('.remote-session-settings')&&!pages.isDirty()&&!pages.isBusy()"), true);
-  console.log('PASS: signed settings discovery, shared controls, exact revision/readback, draft/busy guards, read-only aliases, mobile layout, and surface retirement');
+  console.log('PASS: signed SDK settings, persisted layout with shared-revision conflict, profile create/update/delete and exact target selection, readback, guards, read-only aliases, mobile layout, and retirement');
 } finally {
   socket?.close();
   const exited = new Promise(resolve => browser.once('exit', resolve));

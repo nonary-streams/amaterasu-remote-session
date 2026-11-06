@@ -1,5 +1,7 @@
 {
-  "placements": ["settings"],
+  "placements": [
+    "settings"
+  ],
   "methods": [
     {
       "alias": "preferences",
@@ -20,6 +22,66 @@
       "interface_minor": 0,
       "scope": "configuration.write",
       "min_role": "administrator"
+    },
+    {
+      "alias": "layout",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "layout_get",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.read",
+      "min_role": "viewer"
+    },
+    {
+      "alias": "layout_update",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "layout_update",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.write",
+      "min_role": "administrator"
+    },
+    {
+      "alias": "profiles",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "profiles_get",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.read",
+      "min_role": "viewer"
+    },
+    {
+      "alias": "profile_upsert",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "profile_upsert",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.write",
+      "min_role": "administrator"
+    },
+    {
+      "alias": "profile_delete",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "profile_delete",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.write",
+      "min_role": "administrator"
+    },
+    {
+      "alias": "profile_targets",
+      "provider": "amaterasu.remote-session",
+      "service": "nonary.remote-session/1",
+      "method": "profile_targets",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.read",
+      "min_role": "viewer"
     }
   ]
 }

@@ -73,14 +73,22 @@ namespace RemoteSessionUi {
     let discard: Action | null = null;
     let disposed = false;
     let initialized = false;
+    const childEditors: (() => void)[] = [];
     const canRead = sdk.canCall?.('preferences') !== false;
     const canWrite = sdk.canCall?.('preferences_update') === true;
+    const guards = new EditorGuards((dirty, busy) => {
+      sdk.setDirty?.(dirty);
+      sdk.setBusy?.(busy);
+    });
+    const settingsGuard = guards.create();
     const editor = new SettingsEditor(sdk, render);
 
     const dispose = () => {
       if (disposed) return;
       disposed = true;
       editor.dispose();
+      settingsGuard.dispose();
+      for (const cleanup of childEditors) cleanup();
       for (const field of fields.values()) field.dispose();
       limit?.dispose();
       for (const action of actions) action.dispose();
@@ -159,8 +167,7 @@ namespace RemoteSessionUi {
       discard?.setState({ disabled: !canWrite || editor.busy || !editor.dirty() });
       notice.textContent = editor.message;
       notice.dataset.error = String(editor.error);
-      sdk.setDirty?.(editor.dirty());
-      sdk.setBusy?.(editor.busy);
+      settingsGuard.update(editor.dirty(), editor.busy);
     }
 
     const load = async () => {
@@ -169,6 +176,10 @@ namespace RemoteSessionUi {
         if (disposed || sdk.signal.aborted) return;
         if (!canRead) throw new Error('Your account cannot read remote session settings.');
         await editor.refresh();
+        if (!disposed && !sdk.signal.aborted) {
+          childEditors.push(mountLayout(root, sdk, guards.create()));
+          childEditors.push(mountProfiles(root, sdk, guards.create()));
+        }
       } catch (error) {
         if (!disposed && !sdk.signal.aborted) {
           notice.textContent = errorMessage(error);

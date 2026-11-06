@@ -20,7 +20,7 @@ await writeFile(resolve(root, 'build/tsconfig.json'), JSON.stringify({
     strict: true, noUncheckedIndexedAccess: true, removeComments: true,
     outFile: './remote-session.js', noEmit: process.argv.includes('--check'),
   },
-  files: [declarations, resolve(root, 'src/settings.ts'), resolve(root, 'src/main.ts')],
+  files: [declarations, resolve(root, 'src/layout_model.ts'), resolve(root, 'src/settings.ts'), resolve(root, 'src/profile_model.ts'), resolve(root, 'src/surface_state.ts'), resolve(root, 'src/layout_view.ts'), resolve(root, 'src/profile_view.ts'), resolve(root, 'src/main.ts')],
 }, null, 2) + '\n');
 const result = spawnSync(process.execPath,
   [resolve(root, 'node_modules/typescript/bin/tsc'), '--project', resolve(root, 'build/tsconfig.json')],

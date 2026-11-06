@@ -10,7 +10,7 @@ namespace RemoteSessionUi {
   ] as const;
 
   export type BooleanSetting = typeof booleanSettings[number];
-  export type ProductSettings = Record<BooleanSetting, boolean> & { max_clients: number };
+  export type ProductSettings = Record<BooleanSetting, boolean> & { max_clients: number; remote_monitor_layout: MonitorLayout };
   export interface SettingsReply {
     ok: true;
     settings: ProductSettings;
@@ -42,12 +42,14 @@ namespace RemoteSessionUi {
       throw new Error('The client limit must be a whole number from 1 to 32.');
     }
     result.max_clients = source.max_clients;
+    result.remote_monitor_layout = source.remote_monitor_layout === undefined ? emptyLayout() : parseLayout(source.remote_monitor_layout);
     return result;
   }
 
   export function settingsEqual(left: ProductSettings, right: ProductSettings): boolean {
     return booleanSettings.every(name => left[name] === right[name])
-      && left.max_clients === right.max_clients;
+      && left.max_clients === right.max_clients
+      && layoutEqual(left.remote_monitor_layout, right.remote_monitor_layout);
   }
 
   export function requestError(value: unknown): Error | null {

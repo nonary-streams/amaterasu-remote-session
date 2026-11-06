@@ -36,7 +36,7 @@ const settings = () => ({
   remote_monitor_disconnect_on_client_disconnect: false,
   remote_monitor_terminate_on_first_request: false,
   remote_monitor_confirm_app_replacement: true,
-  max_clients: 16,
+  max_clients: 16, remote_monitor_layout: { version: 1, placements: {} },
 });
 const reply = (revision = 4, values = settings()) => ({ ok: true, revision, settings: values });
 const settle = () => new Promise(setImmediate);
@@ -44,11 +44,11 @@ const settle = () => new Promise(setImmediate);
 function harness({ canWrite = true, call } = {}) {
   const registry = new Map();
   const context = vm.createContext({
-    Error, AbortController,
+    Error, AbortController, TextEncoder,
     document: { createElement: tag => new Element(tag) },
     window: { AmaterasuExtensions: { v1: { register: (id, extension) => registry.set(id, extension) } } },
   });
-  vm.runInContext(ts.transpile(['src/settings.ts', 'src/main.ts']
+  vm.runInContext(ts.transpile(['src/layout_model.ts', 'src/settings.ts', 'src/profile_model.ts', 'src/surface_state.ts', 'src/layout_view.ts', 'src/profile_view.ts', 'src/main.ts']
     .map(file => readFileSync(file, 'utf8')).join('\n'), {
     target: ts.ScriptTarget.ES2022,
   }), context);
@@ -73,7 +73,7 @@ function harness({ canWrite = true, call } = {}) {
   let stored = reply();
   const sdk = {
     signal: controller.signal,
-    canCall: alias => alias === 'preferences' || canWrite,
+    canCall: alias => alias === 'preferences' || alias === 'preferences_update' && canWrite,
     assets: { async stylesheet(path) { assert.equal(path, 'remote-session.css'); } },
     setDirty: value => guards.dirty.push(value),
     setBusy: value => guards.busy.push(value),
@@ -121,6 +121,12 @@ test('signed settings placement declares only read and administrator update meth
   assert.deepEqual(manifest.methods.map(method => [method.alias, method.service, method.method, method.scope, method.min_role]), [
     ['preferences', 'nonary.remote-session/1', 'settings_get', 'configuration.read', 'viewer'],
     ['preferences_update', 'nonary.remote-session/1', 'settings_update', 'configuration.write', 'administrator'],
+    ['layout', 'nonary.remote-session/1', 'layout_get', 'configuration.read', 'viewer'],
+    ['layout_update', 'nonary.remote-session/1', 'layout_update', 'configuration.write', 'administrator'],
+    ['profiles', 'nonary.remote-session/1', 'profiles_get', 'configuration.read', 'viewer'],
+    ['profile_upsert', 'nonary.remote-session/1', 'profile_upsert', 'configuration.write', 'administrator'],
+    ['profile_delete', 'nonary.remote-session/1', 'profile_delete', 'configuration.write', 'administrator'],
+    ['profile_targets', 'nonary.remote-session/1', 'profile_targets', 'configuration.read', 'viewer'],
   ]);
 });
 
