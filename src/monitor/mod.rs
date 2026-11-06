@@ -3,7 +3,9 @@
 //! This provider uses the public virtual-display service. It never adopts an
 //! unrelated connector or treats request admission as readiness or retirement.
 mod composition;
+mod existing;
 pub mod layout;
+mod reconfigure;
 
 use amaterasu_module_sdk::virtual_display::{Operation, SERVICE, VirtualDisplayLayout};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
@@ -76,6 +78,14 @@ impl Default for MonitorSettings {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MonitorMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+    pub hdr: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MonitorSnapshot {
     pub client_id: String,
     pub generation: u64,
@@ -83,12 +93,17 @@ pub struct MonitorSnapshot {
     /// Existing authenticated source reservations remain valid after the role
     /// disconnects, until their own capture lifetimes have retired.
     pub source_ready: bool,
+    pub source_mode: Option<MonitorMode>,
+    pub source_route: String,
     pub retryable: bool,
     /// An exact provider-issued capture selector. No desktop fallback is valid.
     pub output: Option<String>,
     pub error: Option<String>,
     pub cleanup_pending: bool,
     pub reference_released: bool,
+    /// All of this owner's source obligations, including protected composition,
+    /// have retired. A borrowed physical output itself remains present.
+    pub source_reference_released: bool,
     /// A provider may safely retain a desktop anchor after reference release.
     pub parked: bool,
     /// True only after status proves the exact native target has disappeared.
@@ -108,9 +123,17 @@ enum Step {
     CompositionSnapshot,
     CompositionApply,
     CompositionRelease,
+    PrepareMode,
+    ModeSnapshot,
+    ModeApply,
+    CommitMode,
+    ModeReconcile,
+    ExistingPreflight,
+    AbortMode,
 }
 
 struct Monitor {
+    instance_nonce: String,
     client_id: String,
     generation: u64,
     request: MonitorRequest,
@@ -122,11 +145,23 @@ struct Monitor {
     display_target: Option<String>,
     display_payload: Option<Value>,
     scope_reserved: bool,
+    scope_released: bool,
+    scope_cleanup_only: bool,
+    observed_retirement: Option<(bool, bool)>,
     composition_dirty: bool,
     hdr_followup: bool,
     layout_rules: layout::Layout,
     known_targets: BTreeMap<String, String>,
     physical_anchors: Vec<Value>,
+    existing: Option<existing::ExistingTarget>,
+    desired_request: Option<MonitorRequest>,
+    mode_operation: Option<String>,
+    mode_revision: u64,
+    external_borrowed: bool,
+    peer_captures: bool,
+    failed_mode_request: Option<MonitorRequest>,
+    mode_failure: Option<String>,
+    queued_mode_request: Option<MonitorRequest>,
     layout: Option<VirtualDisplayLayout>,
     step: Step,
     call: Option<Call>,
@@ -151,15 +186,51 @@ impl Monitor {
         MonitorSnapshot {
             client_id: self.client_id.clone(),
             generation: self.generation,
-            ready: self.ready && !self.release_requested,
+            ready: self.ready
+                && !self.release_requested
+                && self.mode_failure.is_none()
+                && self.queued_mode_request.is_none(),
             source_ready: self.source_ready,
-            retryable: self.error.is_some() || (!self.ready && !self.reference_released),
+            source_mode: self.source_ready.then(|| {
+                self.existing
+                    .as_ref()
+                    .and_then(|target| target.binding.as_ref())
+                    .map(|binding| MonitorMode {
+                        width: binding.mode.width,
+                        height: binding.mode.height,
+                        refresh_millihz: binding.mode.refresh_millihz,
+                        hdr: binding.mode.hdr_enabled,
+                    })
+                    .unwrap_or(MonitorMode {
+                        width: self.request.width,
+                        height: self.request.height,
+                        refresh_millihz: self.request.refresh_millihz,
+                        hdr: self.request.hdr_enabled,
+                    })
+            }),
+            source_route: self
+                .existing
+                .as_ref()
+                .map(|target| {
+                    target
+                        .binding
+                        .as_ref()
+                        .map_or("default", |binding| binding.route_key.as_str())
+                })
+                .unwrap_or("managed_output")
+                .into(),
+            retryable: !self.effect_stalled
+                && self.mode_failure.is_none()
+                && (self.error.is_some() || (!self.ready && !self.reference_released)),
             output: self.source_ready.then(|| self.output.clone()).flatten(),
-            error: self.error.clone(),
+            error: self.error.clone().or_else(|| self.mode_failure.clone()),
             cleanup_pending: self.release_requested
                 && (!self.reference_released
-                    || (self.captures.is_empty() && !self.source_reference_released)),
+                    || (self.captures.is_empty()
+                        && !self.source_reference_released
+                        && !self.external_borrowed)),
             reference_released: self.reference_released,
+            source_reference_released: self.source_reference_released,
             parked: self.parked,
             native_retired: self.native_retired,
         }
@@ -203,6 +274,15 @@ impl Monitor {
             Step::CompositionSnapshot | Step::CompositionApply | Step::CompositionRelease => {
                 unreachable!("display composition uses its selected service")
             }
+            Step::PrepareMode
+            | Step::ModeSnapshot
+            | Step::ModeApply
+            | Step::CommitMode
+            | Step::ModeReconcile => {
+                unreachable!("retained mode uses its selected contract")
+            }
+            Step::AbortMode => unreachable!("retained mode abort uses Virtual Display SDK"),
+            Step::ExistingPreflight => unreachable!("existing source preflight uses Video SDK"),
         }
     }
 
@@ -231,28 +311,44 @@ impl Monitor {
             .checked_add(1)
             .ok_or("monitor_operation_id_exhausted")?;
         self.serial = serial;
-        let (service, payload) = match self.step {
-            Step::CompositionSnapshot => (
+        let (service, payload) = if self.step == Step::ExistingPreflight {
+            ("amaterasu.video/1", self.existing_preflight_payload()?)
+        } else if self.existing.is_some() {
+            (
                 amaterasu_module_sdk::display::SERVICE,
-                json!({"action":"snapshot"}),
-            ),
-            Step::CompositionApply | Step::CompositionRelease => (
-                amaterasu_module_sdk::display::SERVICE,
-                self.display_payload
-                    .clone()
-                    .ok_or("display_plan_unavailable")?,
-            ),
-            _ => (
-                SERVICE,
-                serde_json::to_value(self.operation()).map_err(|error| error.to_string())?,
-            ),
+                self.existing_operation()?,
+            )
+        } else {
+            match self.step {
+                Step::CompositionSnapshot | Step::ModeSnapshot => (
+                    amaterasu_module_sdk::display::SERVICE,
+                    json!({"action":"snapshot"}),
+                ),
+                Step::CompositionApply | Step::CompositionRelease | Step::ModeApply => (
+                    amaterasu_module_sdk::display::SERVICE,
+                    self.display_payload
+                        .clone()
+                        .ok_or("display_plan_unavailable")?,
+                ),
+                Step::PrepareMode | Step::CommitMode | Step::AbortMode => {
+                    (SERVICE, self.mode_operation()?)
+                }
+                Step::ModeReconcile => (
+                    amaterasu_module_sdk::display::SERVICE,
+                    self.reconcile_operation()?,
+                ),
+                _ => (
+                    SERVICE,
+                    serde_json::to_value(self.operation()).map_err(|error| error.to_string())?,
+                ),
+            }
         };
         self.call = Some(Call::new(
             service,
             payload,
             format!(
-                "remote-monitor-{}-{}-{serial}",
-                self.identity, self.generation
+                "remote-monitor-{}-{}-{}-{serial}",
+                self.instance_nonce, self.identity, self.generation
             ),
             now,
         ));
@@ -276,7 +372,11 @@ impl Monitor {
         if self.call.is_none() {
             self.schedule(
                 if self.reference_released {
-                    Step::InspectSource
+                    if self.existing.is_some() && self.captures.is_empty() {
+                        Step::RemoveSource
+                    } else {
+                        Step::InspectSource
+                    }
                 } else {
                     Step::Remove
                 },
@@ -287,17 +387,43 @@ impl Monitor {
     }
 
     fn accept(&mut self, result: Result<Value, String>, now: Instant) {
+        if matches!(
+            self.step,
+            Step::PrepareMode
+                | Step::ModeSnapshot
+                | Step::ModeApply
+                | Step::CommitMode
+                | Step::ModeReconcile
+                | Step::AbortMode
+        ) {
+            self.accept_mode(result, now);
+            return;
+        }
+        if self.existing.is_some() {
+            self.accept_existing(result, now);
+            return;
+        }
         let payload = match result {
             Ok(payload) if payload["ok"] == true => payload,
             Ok(payload) => {
+                let code = provider_error_code(&payload);
+                if self.step == Step::CompositionRelease && code == "target_in_use" {
+                    // Another authenticated source owns a protected read-only
+                    // reference. Retire this role while retaining the shared
+                    // native source until the other reference is released.
+                    self.external_borrowed = true;
+                    self.error = None;
+                    self.next_poll = now + HEALTH_INTERVAL;
+                    return;
+                }
                 self.ready = false;
+                self.source_ready = false;
                 self.output = None;
-                self.error = Some(
-                    payload["code"]
-                        .as_str()
-                        .unwrap_or("monitor_provider_rejected")
-                        .into(),
-                );
+                self.error = Some(code.into());
+                if matches!(self.step, Step::CompositionApply | Step::CompositionRelease) {
+                    self.retry_composition(code, now);
+                    return;
+                }
                 // A rejected call is not proof of native resource absence.
                 self.schedule(
                     if self.release_requested {
@@ -312,8 +438,15 @@ impl Monitor {
             }
             Err(error) => {
                 self.ready = false;
+                self.source_ready = false;
                 self.output = None;
                 self.error = Some(error);
+                if matches!(self.step, Step::CompositionApply | Step::CompositionRelease) {
+                    // The native transition may have committed. Its provider
+                    // operation identity and exact payload remain unchanged.
+                    self.next_poll = now + RETRY_INTERVAL;
+                    return;
+                }
                 self.schedule(
                     if self.release_requested {
                         Step::VerifyRemove
@@ -353,6 +486,22 @@ impl Monitor {
         }
     }
 
+    fn retry_composition(&mut self, error: &str, now: Instant) {
+        match error {
+            "topology_changed" | "revision_conflict" | "topology_revision_conflict" => {
+                self.schedule(Step::CompositionSnapshot, now, RETRY_INTERVAL)
+            }
+            "mutation_disabled"
+            | "unsupported_platform"
+            | "unsupported_primary"
+            | "target_ownership_unverified" => {
+                self.error = Some(error.into());
+                self.effect_stalled = true;
+            }
+            _ => self.next_poll = now + RETRY_INTERVAL,
+        }
+    }
+
     fn inspect(&mut self, payload: Value, now: Instant) {
         let source_step = self.source_step();
         let Some(reference_owned) = payload["reference_owned"].as_bool() else {
@@ -381,11 +530,21 @@ impl Monitor {
         if self.release_requested {
             if source_step && reference_owned {
                 self.source_reference_owned = true;
+                if let Some(target) = monitor
+                    .and_then(|monitor| monitor["ready"]["device_path"].as_str())
+                    .filter(|target| {
+                        !target.is_empty()
+                            && target.len() <= 4096
+                            && !target.chars().any(char::is_control)
+                    })
+                {
+                    self.display_target = Some(target.into());
+                }
                 if !self.reference_released {
                     self.schedule(Step::Remove, now, Duration::ZERO);
                 } else if self.captures.is_empty() {
                     self.schedule(
-                        if self.scope_reserved {
+                        if self.display_target.is_some() {
                             Step::CompositionSnapshot
                         } else {
                             Step::RemoveSource
@@ -406,10 +565,10 @@ impl Monitor {
             }
             if !source_step {
                 self.reference_released = true;
-                if self.source_reference_owned {
-                    self.schedule(Step::InspectSource, now, Duration::ZERO);
-                    return;
-                }
+                // A restarted plugin has not yet observed its independent
+                // source reference. Always reconcile that exact reference.
+                self.schedule(Step::InspectSource, now, Duration::ZERO);
+                return;
             } else {
                 self.source_reference_owned = false;
                 self.source_ready = false;
@@ -454,8 +613,17 @@ impl Monitor {
                 self.native_retired = true;
             }
             self.reference_released = true;
-            self.source_reference_released = true;
-            self.error = None;
+            self.observed_retirement = Some((self.parked, self.native_retired));
+            if !self.captures.is_empty() {
+                self.error = Some("monitor_capture_retirement_pending".into());
+                self.schedule(Step::VerifySourceRemove, now, HEALTH_INTERVAL);
+                return;
+            }
+            if self.scope_released {
+                self.finish_retirement();
+            } else {
+                self.schedule(Step::CompositionSnapshot, now, Duration::ZERO);
+            }
             return;
         }
         if !reference_owned {
@@ -466,11 +634,18 @@ impl Monitor {
                 self.schedule(Step::CreateSource, now, Duration::ZERO);
             } else if monitor.is_some() {
                 self.reject_status("monitor_reference_not_owned", now);
+            } else if !self.captures.is_empty() {
+                self.reject_status("monitor_source_lost_waiting_for_capture_retirement", now);
             } else if self.create_attempts >= MAX_EFFECT_ATTEMPTS {
                 self.error = Some("monitor_creation_requires_retry".into());
                 self.effect_stalled = true;
             } else {
-                self.schedule(Step::Create, now, Duration::ZERO);
+                if !self.scope_released {
+                    self.scope_cleanup_only = true;
+                    self.schedule(Step::CompositionSnapshot, now, Duration::ZERO);
+                } else {
+                    self.schedule(Step::Create, now, Duration::ZERO);
+                }
             }
             return;
         }
@@ -478,6 +653,10 @@ impl Monitor {
             self.reject_status("monitor_reference_without_target", now);
             return;
         };
+        self.mode_revision = monitor["mode_revision"].as_u64().unwrap_or(0);
+        if self.restore_mode_intent(monitor, now) {
+            return;
+        }
         if source_step {
             self.source_reference_owned = true;
             self.source_reference_released = false;
@@ -516,16 +695,20 @@ impl Monitor {
 
     fn accept_composition(&mut self, payload: Value, now: Instant) {
         if self.step == Step::CompositionSnapshot {
-            let Some(target_id) = self.display_target.as_deref() else {
+            let release = self.scope_cleanup_only
+                || self.release_requested && self.reference_released && self.captures.is_empty();
+            let target_id = if release {
+                self.display_target.as_deref().unwrap_or("")
+            } else if let Some(target) = self.display_target.as_deref() {
+                target
+            } else {
                 self.reject_status("monitor_target_unavailable", now);
                 return;
             };
             let operation_id = format!(
-                "remote-layout-{}-{}-{}",
-                self.identity, self.generation, self.serial
+                "remote-layout-{}-{}-{}-{}",
+                self.instance_nonce, self.identity, self.generation, self.serial
             );
-            let release =
-                self.release_requested && self.reference_released && self.captures.is_empty();
             let result = composition::prepare(
                 composition::TargetRequest {
                     client: &self.client_id,
@@ -545,6 +728,12 @@ impl Monitor {
             );
             match result {
                 Ok(composition) => {
+                    if self.peer_captures && composition::translates_origin(&composition.payload) {
+                        self.composition_dirty = true;
+                        self.error = None;
+                        self.schedule(Step::InspectSource, now, HEALTH_INTERVAL);
+                        return;
+                    }
                     if !release {
                         self.physical_anchors = composition.physical_anchors;
                     }
@@ -564,26 +753,61 @@ impl Monitor {
             }
             return;
         }
-        if self.display_payload.as_ref().is_none_or(|plan| {
-            payload["operation_id"] != plan["operation_id"]
-                || payload["target_id"] != plan["target"]["id"]
-                    && self.step == Step::CompositionApply
-        }) {
+        if !(self.step == Step::CompositionRelease
+            && payload["released"] == true
+            && payload["already_complete"] == true)
+            && self.display_payload.as_ref().is_none_or(|plan| {
+                payload["operation_id"] != plan["operation_id"]
+                    || payload["target_id"] != plan["target"]["id"]
+                        && self.step == Step::CompositionApply
+            })
+        {
             self.reject_status("invalid_display_composition_result", now);
             return;
         }
         match self.step {
-            Step::CompositionApply if payload["applied"] == true => {
+            Step::CompositionApply
+                if payload["applied"] == true || payload["reconciled"] == true =>
+            {
                 self.scope_reserved = true;
+                self.scope_released = false;
                 self.composition_dirty = self.hdr_followup;
                 self.schedule(Step::InspectSource, now, Duration::ZERO);
             }
             Step::CompositionRelease if payload["released"] == true => {
                 self.scope_reserved = false;
-                self.schedule(Step::RemoveSource, now, Duration::ZERO);
+                self.scope_released = true;
+                self.external_borrowed = false;
+                if self.observed_retirement.is_some() {
+                    self.finish_retirement();
+                } else if self.scope_cleanup_only {
+                    self.scope_cleanup_only = false;
+                    self.schedule(
+                        if self.release_requested {
+                            Step::Remove
+                        } else {
+                            Step::Create
+                        },
+                        now,
+                        Duration::ZERO,
+                    );
+                } else {
+                    self.schedule(Step::RemoveSource, now, Duration::ZERO);
+                }
             }
             _ => self.reject_status("display_composition_unconfirmed", now),
         }
+    }
+
+    fn finish_retirement(&mut self) {
+        if let Some((parked, native_retired)) = self.observed_retirement.take() {
+            self.parked = parked;
+            self.native_retired = native_retired;
+        }
+        self.source_reference_released = true;
+        self.source_ready = false;
+        self.output = None;
+        self.error = None;
     }
 
     fn accept_source_readiness(&mut self, monitor: &Value, now: Instant) -> bool {
@@ -657,16 +881,25 @@ pub struct MonitorManager {
     generations: BTreeMap<String, u64>,
     shutting_down: bool,
     layout: layout::Layout,
+    instance_nonce: String,
+    startup_error: Option<String>,
 }
 
 impl MonitorManager {
     pub fn new(settings: MonitorSettings) -> Self {
+        let mut nonce = [0u8; 16];
+        let startup_error = getrandom::fill(&mut nonce)
+            .err()
+            .map(|_| "monitor_entropy_unavailable".into());
+        let instance_nonce = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         Self {
             settings,
             monitors: BTreeMap::new(),
             generations: BTreeMap::new(),
             shutting_down: false,
             layout: layout::Layout::default(),
+            instance_nonce,
+            startup_error,
         }
     }
 
@@ -677,10 +910,14 @@ impl MonitorManager {
         request: MonitorRequest,
         now: Instant,
     ) -> Result<MonitorSnapshot, String> {
+        if let Some(error) = &self.startup_error {
+            return Err(error.clone());
+        }
         if !valid_identity(client) || generation == 0 || self.shutting_down {
             return Err("invalid_monitor_owner".into());
         }
         request.validate()?;
+        let existing = existing::selection(&request.profile_settings)?;
         if self.monitors.get(client).is_some_and(|existing| {
             existing.reference_released
                 && existing.source_reference_released
@@ -692,8 +929,67 @@ impl MonitorManager {
             if existing.generation != generation {
                 return Err("monitor_generation_conflict".into());
             }
+            if let Some(failed) = &existing.failed_mode_request {
+                if failed == &request {
+                    return Err(existing
+                        .mode_failure
+                        .clone()
+                        .unwrap_or_else(|| "retained_mode_rejected".into()));
+                }
+                existing.failed_mode_request = None;
+                existing.mode_failure = None;
+            }
+            if existing.request == request {
+                existing.queued_mode_request =
+                    existing.desired_request.as_ref().map(|_| request.clone());
+            }
             if existing.request != request {
-                return Err("retained_monitor_profile_conflict".into());
+                if existing.request.profile_id != request.profile_id
+                    || existing.request.profile_settings != request.profile_settings
+                {
+                    return Err("retained_monitor_profile_conflict".into());
+                }
+                if existing.existing.is_some() {
+                    // Encoded client dimensions do not authorize modifying an
+                    // explicitly borrowed physical source or its frozen mode.
+                    existing.request = request;
+                    return Ok(existing.snapshot());
+                }
+                if let Some(desired) = &existing.desired_request {
+                    return if desired == &request {
+                        Ok(existing.snapshot())
+                    } else {
+                        Err("monitor_mode_busy".into())
+                    };
+                }
+                if !existing.ready
+                    || !existing.source_reference_owned
+                    || !existing.scope_reserved
+                    || existing.display_target.is_none()
+                {
+                    if existing.release_requested || !existing.captures.is_empty() {
+                        return Err("monitor_mode_busy".into());
+                    }
+                    // Finish reconciling the admitted initial target first.
+                    // The queued request suppresses publication of its old mode.
+                    existing.queued_mode_request = Some(request);
+                    return Ok(existing.snapshot());
+                }
+                if !existing.captures.is_empty()
+                    || existing.call.is_some()
+                    || existing.release_requested
+                {
+                    return Err("monitor_mode_busy".into());
+                }
+                if existing.desired_request.is_none() {
+                    existing.ready = false;
+                    existing.source_ready = false;
+                    existing.output = None;
+                    existing.mode_operation = Some(existing.new_mode_operation(&request));
+                    existing.desired_request = Some(request);
+                    existing.schedule(Step::PrepareMode, now, Duration::ZERO);
+                }
+                return Ok(existing.snapshot());
             }
             if existing.release_requested || existing.reference_released {
                 return Err("monitor_cleanup_pending".into());
@@ -722,6 +1018,7 @@ impl MonitorManager {
         let reference = format!("remote-monitor-{identity}-{generation}");
         let source_reference = format!("remote-source-{identity}-{generation}");
         let monitor = Monitor {
+            instance_nonce: self.instance_nonce.clone(),
             client_id: client.into(),
             generation,
             request,
@@ -733,11 +1030,23 @@ impl MonitorManager {
             display_target: None,
             display_payload: None,
             scope_reserved: false,
+            scope_released: false,
+            scope_cleanup_only: false,
+            observed_retirement: None,
             composition_dirty: true,
             hdr_followup: false,
             layout_rules: self.layout.clone(),
             known_targets: BTreeMap::new(),
             physical_anchors: Vec::new(),
+            existing,
+            desired_request: None,
+            mode_operation: None,
+            mode_revision: 0,
+            external_borrowed: false,
+            peer_captures: false,
+            failed_mode_request: None,
+            mode_failure: None,
+            queued_mode_request: None,
             layout: Some(VirtualDisplayLayout::Extended),
             step: Step::Inspect,
             call: None,
@@ -793,8 +1102,11 @@ impl MonitorManager {
     ) -> Result<(), String> {
         let monitor = self.monitors.get_mut(client).ok_or("monitor_not_owned")?;
         if monitor.generation != generation
-            || !monitor.ready
-            || monitor.release_requested
+            || monitor.mode_failure.is_some()
+            || !(monitor.ready && !monitor.release_requested
+                || monitor.source_ready
+                    && monitor.release_requested
+                    && !monitor.captures.is_empty())
             || !valid_identity(transport_id)
         {
             return Err("monitor_capture_not_admitted".into());
@@ -822,7 +1134,9 @@ impl MonitorManager {
             if monitor.release_requested && monitor.captures.is_empty() && monitor.call.is_none() {
                 monitor.schedule(
                     if monitor.reference_released {
-                        if monitor.scope_reserved {
+                        if monitor.existing.is_some() {
+                            Step::RemoveSource
+                        } else if monitor.scope_reserved {
                             Step::CompositionSnapshot
                         } else {
                             Step::RemoveSource
@@ -843,6 +1157,7 @@ impl MonitorManager {
         for monitor in self.monitors.values_mut() {
             monitor.layout_rules = self.layout.clone();
             monitor.composition_dirty = true;
+            monitor.effect_stalled = false;
             if !monitor.release_requested && monitor.captures.is_empty() && monitor.call.is_none() {
                 monitor.ready = false;
                 monitor.next_poll = Instant::now();
@@ -942,16 +1257,31 @@ impl MonitorManager {
                     .map(|target| (target.clone(), monitor.client_id.clone()))
             })
             .collect::<BTreeMap<_, _>>();
+        let active_clients = self
+            .monitors
+            .values()
+            .filter(|monitor| !monitor.captures.is_empty())
+            .map(|monitor| monitor.client_id.clone())
+            .collect::<BTreeSet<_>>();
         for monitor in self.monitors.values_mut() {
             monitor.known_targets = known_targets.clone();
+            monitor.peer_captures = active_clients
+                .iter()
+                .any(|client| client != &monitor.client_id);
             if monitor.source_reference_released
                 || monitor.effect_stalled
                 || now < monitor.next_poll
             {
                 continue;
             }
-            if monitor.call.is_none() {
-                monitor.queue(now)?;
+            if monitor.call.is_none()
+                && let Err(error) = monitor.queue(now)
+            {
+                monitor.error = Some(error);
+                monitor.ready = false;
+                monitor.source_ready = false;
+                monitor.effect_stalled = true;
+                continue;
             }
             let outcome = monitor
                 .call
@@ -961,6 +1291,7 @@ impl MonitorManager {
             if let Some(result) = outcome {
                 monitor.call = None;
                 monitor.accept(result, now);
+                monitor.activate_queued_mode(now);
             }
         }
         Ok(())
@@ -1042,6 +1373,19 @@ fn settled(response: ModuleResult<Response>) -> bool {
 
 fn valid_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn provider_error_code(payload: &Value) -> &str {
+    payload
+        .get("code")
+        .or_else(|| payload.get("error").and_then(|error| error.get("code")))
+        .and_then(Value::as_str)
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 128
+                && code.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+        .unwrap_or("invalid_provider_error")
 }
 
 fn valid_output(value: &Value) -> bool {

@@ -40,11 +40,11 @@ pub(super) fn prepare(
         .ok_or("invalid_display_snapshot")?;
     if release {
         return Ok(Composition {
-            payload: json!({
+            payload: checked_operation(json!({
                 "action":"scoped_release","operation_id":operation_id,
                 "identity":target.identity,"reference_id":target.reference,
                 "expected_topology_revision":revision,
-            }),
+            }))?,
             needs_hdr_followup: false,
             physical_anchors: Vec::new(),
         });
@@ -53,10 +53,13 @@ pub(super) fn prepare(
         .as_array()
         .filter(|displays| displays.len() <= 16)
         .ok_or("invalid_display_snapshot")?;
-    let baseline = displays
+    let mut baseline = displays
         .iter()
         .map(|display| node(display, target.known_targets))
         .collect::<Result<Vec<_>, _>>()?;
+    for display in &mut baseline {
+        observe_logical_footprint(display, &snapshot)?;
+    }
     let physical_anchors = baseline.iter().filter(|display| display.client_id.is_none()).enumerate().map(|(index,display)| json!({
         "id":physical_alias(&display.id),"label":format!("Display {} ({}x{})",index+1,display.width,display.height),
     })).collect::<Vec<_>>();
@@ -79,14 +82,17 @@ pub(super) fn prepare(
         "refresh":{"numerator":target.refresh_millihz,"denominator":1000},
         "x":existing.map_or(0,|display| display.x),
         "y":existing.map_or(0,|display| display.y),
-        "rotation":"identity","hdr_enabled":target.hdr && !needs_hdr_followup,
+        "rotation":existing.map(|display|display.configuration["rotation"].clone()).unwrap_or_else(||json!("identity")),"hdr_enabled":target.hdr && !needs_hdr_followup,
     });
     let mut requested = node(&setting, target.known_targets)?;
     requested.client_id = Some(target.client.into());
     if let Some(existing) = existing {
         requested.scale = existing.scale;
-        requested.logical_size = existing.logical_size;
+        if requested.width == existing.width && requested.height == existing.height {
+            requested.logical_size = existing.logical_size;
+        }
     }
+    observe_logical_footprint(&mut requested, &snapshot)?;
     let planned = layout.plan_target(
         target.client,
         &requested,
@@ -113,10 +119,22 @@ pub(super) fn prepare(
         "primary":planned.primary_requested,
     });
     Ok(Composition {
-        payload,
+        payload: checked_operation(payload)?,
         needs_hdr_followup,
         physical_anchors,
     })
+}
+
+pub(super) fn checked_operation(payload: Value) -> Result<Value, String> {
+    let operation: amaterasu_module_sdk::display::ScopedOperation =
+        serde_json::from_value(payload).map_err(|_| "invalid_public_display_operation")?;
+    operation.payload()
+}
+
+pub(super) fn translates_origin(payload: &Value) -> bool {
+    payload["primary"] == true
+        && (payload["target"]["x"].as_i64() != Some(0)
+            || payload["target"]["y"].as_i64() != Some(0))
 }
 
 fn physical_alias(id: &str) -> String {
@@ -124,6 +142,42 @@ fn physical_alias(id: &str) -> String {
     hash.update(b"amaterasu.remote-monitor.physical-anchor.v1\0");
     hash.update(id.as_bytes());
     format!("physical-{:x}", hash.finalize())
+}
+
+fn observe_logical_footprint(display: &mut DisplayNode, snapshot: &Value) -> Result<(), String> {
+    let Some(outputs) = snapshot["session_state"]["outputs"].as_array() else {
+        return if snapshot["platform"] == "linux_kscreen" {
+            Err("logical_display_geometry_unavailable".into())
+        } else {
+            Ok(())
+        };
+    };
+    let matching = outputs
+        .iter()
+        .filter(|output| output["id"] == display.id)
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        return Err("ambiguous_logical_display_geometry".into());
+    }
+    let Some(output) = matching.first() else {
+        return Ok(());
+    };
+    let scale = output["scale"]
+        .as_f64()
+        .filter(|scale| scale.is_finite() && (0.25..=5.0).contains(scale))
+        .ok_or("invalid_display_scale")?;
+    let (width, height) = if matches!(display.rotation, Rotation::Rotate90 | Rotation::Rotate270) {
+        (display.height, display.width)
+    } else {
+        (display.width, display.height)
+    };
+    let logical = (f64::from(width) / scale).ceil();
+    let logical_height = (f64::from(height) / scale).ceil();
+    if logical > 1_000_000.0 || logical_height > 1_000_000.0 {
+        return Err("invalid_logical_display_size".into());
+    }
+    display.logical_size = Some((logical as u32, logical_height as u32));
+    Ok(())
 }
 
 fn node(
