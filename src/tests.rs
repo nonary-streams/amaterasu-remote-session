@@ -298,6 +298,74 @@ fn source_verifier_does_not_gain_other_generic_or_public_operations() {
 }
 
 #[test]
+fn malformed_dispatch_identity_cannot_create_an_owner_or_poison_later_admission() {
+    let mut host = Box::<Host>::default();
+    let mut module = start(&mut host);
+    drive(&mut module, 4);
+    let initial_document = module.policy.desired_document();
+    let initial_calls = host.services.len();
+    for (index, identity) in [
+        "disabled-monitor-client".into(),
+        "AB".repeat(32),
+        "a".repeat(63),
+        "a".repeat(65),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request_id = 100 + index as u64;
+        let mut request = input_dispatch();
+        request["arguments"]["context"]["client"]["id"] = json!(identity);
+        host.submit(request_id, "wire", presentation::SERVICE, request);
+        drive(&mut module, 1);
+        assert_eq!(host.completed[&request_id]["result"], "error");
+        assert_eq!(
+            host.completed[&request_id]["code"],
+            "invalid_client_identity"
+        );
+        assert!(
+            serde_json::to_vec(&host.completed[&request_id])
+                .unwrap()
+                .len()
+                < 256
+        );
+        drive(&mut module, 6);
+        module.health().unwrap();
+        assert_eq!(module.policy.desired_document(), initial_document);
+        assert!(host.journal.is_none());
+        assert_eq!(host.state_revision, 0);
+        assert_eq!(host.services.len(), initial_calls);
+    }
+
+    let mut denied = input_dispatch();
+    denied["arguments"]["operation_id"] = json!("denied-input");
+    denied["arguments"]["context"]["client"]["may_view"] = json!(false);
+    denied["arguments"]["context"]["client"]["may_launch"] = json!(false);
+    denied["arguments"]["context"]["client"]["may_terminate"] = json!(false);
+    host.submit(150, "wire", presentation::SERVICE, denied);
+    drive(&mut module, 1);
+    assert_eq!(host.completed[&150]["decision"]["kind"], "reject");
+    assert_eq!(host.completed[&150]["decision"]["status_code"], 403);
+    assert_eq!(module.policy.desired_document(), initial_document);
+    assert_eq!(host.services.len(), initial_calls);
+
+    host.submit(200, "wire", presentation::SERVICE, input_dispatch());
+    drive(&mut module, 12);
+    host.submit(201, "wire", presentation::SERVICE, input_dispatch());
+    drive(&mut module, 1);
+    module.health().unwrap();
+    assert_eq!(host.completed[&201]["result"], "dispatched");
+    assert_eq!(host.completed[&201]["decision"]["kind"], "auxiliary");
+    let owners = host.journal.as_ref().unwrap()["owners"].as_array().unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0]["client_id"], "ab".repeat(32));
+    assert!(host.services.iter().all(|(service, _)| matches!(
+        service.as_str(),
+        "amaterasu.configuration/1" | "amaterasu.state/1" | "amaterasu.pairing/1"
+    )));
+}
+
+#[test]
 fn pending_owner_persistence_never_delivers_an_auxiliary_plan_or_creates_a_display() {
     let mut host = Box::<Host>::default();
     let mut module = start(&mut host);

@@ -17,6 +17,7 @@ mod transactions;
 use amaterasu_module_sdk::session_presentation::{self as presentation, Reply, Request};
 use amaterasu_module_sdk::{
     ApiMethod, Command, ManagedModule, ModuleResult, Response, RuntimeClient, operation_api,
+    pairing_authority,
 };
 use journal::OwnerJournal;
 use monitor::layout::Layout;
@@ -522,6 +523,24 @@ impl RemoteSessionModule {
                 id,
                 Reply::Pending {
                     retry_after_ms: 250,
+                },
+            );
+        }
+        if let Request::Dispatch { context, .. } = &request
+            && (pairing_authority::Request::ClientAuthorization {
+                certificate_id: context.client.id.clone(),
+            })
+            .validate()
+            .is_err()
+        {
+            // This provider binds retained ownership to pairing certificates.
+            // Validate that product binding before the policy creates an owner
+            // that would later require an impossible authority observation.
+            return self.complete_presentation(
+                id,
+                Reply::Error {
+                    code: "invalid_client_identity".into(),
+                    message: "Remote sessions require a canonical certificate fingerprint".into(),
                 },
             );
         }
