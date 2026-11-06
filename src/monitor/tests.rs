@@ -31,6 +31,9 @@ struct Provider {
     mode_commit_pending: u8,
     reject_mode: bool,
     target_unavailable: bool,
+    scope_status_operation: Option<String>,
+    scope_status_pending: bool,
+    last_scope_request: Option<Value>,
 }
 
 impl Default for Provider {
@@ -64,6 +67,9 @@ impl Default for Provider {
             mode_commit_pending: 0,
             reject_mode: false,
             target_unavailable: false,
+            scope_status_operation: None,
+            scope_status_pending: false,
+            last_scope_request: None,
         }
     }
 }
@@ -153,8 +159,22 @@ impl Provider {
                     self.references
                 );
                 let desired = json!({"identity":payload["identity"],"name":"Remote Monitor","width":payload["width"],"height":payload["height"],"refresh_millihz":payload["refresh_millihz"],"hdr_enabled":payload["hdr_enabled"]});
+                if let Some(change) = &self.mode_change {
+                    if change["operation_id"] == payload["operation_id"] {
+                        if change["expected_mode_revision"] != payload["expected_mode_revision"]
+                            || change["requested_specification"] != desired
+                        {
+                            return json!({"ok":false,"code":"reconfigure_conflict"});
+                        }
+                        if change["state"] != "prepared" {
+                            return change.clone();
+                        }
+                    } else if change["state"] == "prepared" {
+                        return json!({"ok":false,"code":"reconfigure_conflict"});
+                    }
+                }
                 self.mode_change = Some(
-                    json!({"ok":true,"state":"prepared","operation_id":payload["operation_id"],"specification":desired,"reference_id":payload["reference_id"],"expected_reference_ids":payload["expected_reference_ids"],"expected_mode_revision":payload["expected_mode_revision"]}),
+                    json!({"ok":true,"state":"prepared","operation_id":payload["operation_id"],"specification":desired,"requested_specification":desired,"reference_id":payload["reference_id"],"expected_reference_ids":payload["expected_reference_ids"],"expected_mode_revision":payload["expected_mode_revision"]}),
                 );
                 if self.mode_prepare_pending > 0 {
                     self.mode_prepare_pending -= 1;
@@ -256,9 +276,17 @@ impl Provider {
                 json!({"ok":true,"topology_revision":"0123456789abcdef0123456789abcdef","configuration":{"displays":displays}})
             }
             "scoped_apply" => {
+                self.last_scope_request = Some(payload.clone());
                 let reconciled = !self
                     .applied_display_ops
                     .insert(payload["operation_id"].as_str().unwrap().into());
+                if self.lose_scope_result && !reconciled {
+                    self.scope_status_operation =
+                        payload["operation_id"].as_str().map(str::to_owned);
+                    self.scope_status_pending = true;
+                } else if reconciled {
+                    self.scope_status_pending = false;
+                }
                 json!({"ok":true,"applied":!reconciled,"reconciled":reconciled,"operation_id":payload["operation_id"],"target_id":payload["target"]["id"]})
             }
             "scoped_release" => {
@@ -280,7 +308,19 @@ impl Provider {
                 json!({"ok":true,"applied":!reconciled,"reconciled":reconciled,"operation_id":payload["operation_id"],"target_id":payload["target"]["id"]})
             }
             "scoped_reconcile" => {
-                json!({"ok":true,"state":if self.mode_applied{"succeeded"}else{"not_applied"},"operation_id":payload["operation_id"],"mode_operation_id":self.mode_change.as_ref().unwrap()["operation_id"],"target_id":"Virtual-7"})
+                if payload["operation_id"]
+                    .as_str()
+                    .is_some_and(|operation| operation.ends_with("-display"))
+                    && let Some(change) = &self.mode_change
+                {
+                    json!({"ok":true,"state":if self.mode_applied{"succeeded"}else{"not_applied"},"operation_id":payload["operation_id"],"mode_operation_id":change["operation_id"],"target_id":"Virtual-7"})
+                } else {
+                    self.scope_status_pending = false;
+                    json!({"ok":true,"state":"succeeded","operation_id":payload["operation_id"],"target_id":"Virtual-7"})
+                }
+            }
+            "scoped_status" => {
+                json!({"ok":true,"identity":payload["identity"],"reference_id":payload["reference_id"],"operation_id":self.scope_status_operation,"pending":self.scope_status_pending})
             }
             _ => panic!("unknown display operation"),
         }
@@ -328,7 +368,7 @@ fn request() -> MonitorRequest {
 }
 
 fn tick(manager: &mut MonitorManager, provider: &mut Provider, now: Instant) {
-    for _ in 0..24 {
+    for _ in 0..48 {
         manager
             .tick(now, &mut |command| provider.send(command))
             .unwrap();
@@ -1185,4 +1225,119 @@ fn lost_native_output_does_not_recreate_or_retire_a_source_with_live_capture_hol
     manager.capture_stopped("alice", 3, "old-capture", now + HEALTH_INTERVAL * 2);
     tick(&mut manager, &mut provider, now + HEALTH_INTERVAL * 3);
     assert!(manager.snapshot("alice").unwrap().source_reference_released);
+}
+
+#[test]
+fn restarted_layout_recovers_the_exact_admitted_operation_before_a_fresh_plan() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider {
+        lose_scope_result: true,
+        ..Provider::default()
+    };
+    manager.begin("alice", 3, request(), now).unwrap();
+    tick(&mut manager, &mut provider, now);
+    provider.state = "ready";
+    tick(&mut manager, &mut provider, now + RETRY_INTERVAL);
+    assert!(provider.scope_status_pending);
+    let original = provider.scope_status_operation.clone().unwrap();
+    drop(manager);
+    let mut recovered = MonitorManager::new(MonitorSettings::default());
+    recovered
+        .begin("alice", 3, request(), now + RETRY_INTERVAL)
+        .unwrap();
+    tick(&mut recovered, &mut provider, now + RETRY_INTERVAL);
+    assert!(recovered.snapshot("alice").unwrap().ready);
+    assert!(
+        provider
+            .observed
+            .iter()
+            .any(|operation| operation["action"] == "scoped_reconcile"
+                && operation["operation_id"] == original)
+    );
+    assert_ne!(
+        provider.last_scope_request.as_ref().unwrap()["operation_id"],
+        original
+    );
+    assert_eq!(
+        provider
+            .observed
+            .iter()
+            .filter(|operation| operation["action"] == "create")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn restarted_mode_identity_is_bound_to_persisted_revision_and_requested_mode() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider::default();
+    ready(&mut manager, &mut provider, now);
+    let mut first = request();
+    first.refresh_millihz = 120000;
+    manager.begin("alice", 3, first.clone(), now).unwrap();
+    tick(&mut manager, &mut provider, now);
+    let previous = provider.mode_change.as_ref().unwrap()["operation_id"].clone();
+    drop(manager);
+    let mut recovered = MonitorManager::new(MonitorSettings::default());
+    recovered.begin("alice", 3, first, now).unwrap();
+    tick(&mut recovered, &mut provider, now);
+    assert!(recovered.snapshot("alice").unwrap().ready);
+    let mut next = request();
+    next.width = 2560;
+    next.height = 1440;
+    recovered.begin("alice", 3, next, now).unwrap();
+    tick(&mut recovered, &mut provider, now);
+    assert!(recovered.snapshot("alice").unwrap().ready);
+    assert_ne!(
+        provider.mode_change.as_ref().unwrap()["operation_id"],
+        previous
+    );
+    assert_eq!(
+        recovered
+            .snapshot("alice")
+            .unwrap()
+            .source_mode
+            .unwrap()
+            .width,
+        2560
+    );
+}
+
+#[test]
+fn aborted_mode_restart_preserves_old_source_and_accepts_another_supported_mode() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider::default();
+    ready(&mut manager, &mut provider, now);
+    provider.reject_mode = true;
+    let mut rejected = request();
+    rejected.refresh_millihz = 240000;
+    manager.begin("alice", 3, rejected.clone(), now).unwrap();
+    tick(&mut manager, &mut provider, now);
+    drop(manager);
+    let mut recovered = MonitorManager::new(MonitorSettings::default());
+    recovered.begin("alice", 3, rejected, now).unwrap();
+    tick(&mut recovered, &mut provider, now);
+    let old = recovered.snapshot("alice").unwrap();
+    assert!(old.source_ready);
+    assert!(!old.retryable);
+    assert_eq!(old.source_mode.unwrap().refresh_millihz, 60000);
+    provider.reject_mode = false;
+    let mut supported = request();
+    supported.refresh_millihz = 120000;
+    recovered.begin("alice", 3, supported, now).unwrap();
+    tick(&mut recovered, &mut provider, now);
+    assert!(recovered.snapshot("alice").unwrap().ready);
+    assert_eq!(
+        recovered
+            .snapshot("alice")
+            .unwrap()
+            .source_mode
+            .unwrap()
+            .refresh_millihz,
+        120000
+    );
 }

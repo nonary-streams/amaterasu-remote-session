@@ -60,59 +60,73 @@ impl Monitor {
             self.schedule(Step::InspectSource, now, RETRY_INTERVAL);
             return true;
         }
-        if intent["state"] != "prepared" {
+        let aborted = intent["state"] == "aborted";
+        if intent["state"] != "prepared" && !aborted {
             return false;
         }
-        let requested = &self.request;
-        let desired = &intent["specification"];
         let expected = BTreeSet::from([self.reference.clone(), self.source_reference.clone()]);
-        let observed = intent["expected_reference_ids"]
-            .as_array()
-            .map(|references| {
-                references
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<BTreeSet<_>>()
-            });
+        let references = intent["expected_reference_ids"].as_array();
+        let observed = references.map(|references| {
+            references
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        });
+        let revision_matches = if aborted {
+            intent["mode_revision"] == self.mode_revision
+                && intent["expected_mode_revision"]
+                    .as_u64()
+                    .and_then(|revision| revision.checked_add(1))
+                    == Some(self.mode_revision)
+        } else {
+            intent["expected_mode_revision"] == self.mode_revision
+        };
         let operation = intent["operation_id"]
             .as_str()
             .filter(|operation| valid_identity(operation));
         let bound = intent["reference_id"] == self.source_reference
             && observed.as_ref() == Some(&expected)
-            && intent["expected_mode_revision"] == self.mode_revision
-            && desired["identity"] == self.identity
-            && desired["name"] == "Remote Monitor"
-            && desired["width"] == requested.width
-            && desired["height"] == requested.height
-            && desired["refresh_millihz"] == requested.refresh_millihz
-            && desired["hdr_enabled"] == requested.hdr_enabled;
+            && references.is_some_and(|references| references.len() == expected.len())
+            && revision_matches;
         let Some(operation) = operation.filter(|_| bound) else {
             self.reject_status("retained_mode_intent_mismatch", now);
             return true;
         };
-        let previous = &monitor["specification"];
-        let old_mode = || -> Option<(u32, u32, u32, bool)> {
-            Some((
-                u32::try_from(previous["width"].as_u64()?).ok()?,
-                u32::try_from(previous["height"].as_u64()?).ok()?,
-                u32::try_from(previous["refresh_millihz"].as_u64()?).ok()?,
-                previous["hdr_enabled"].as_bool()?,
-            ))
+        let previous = match request_from_specification(
+            &self.request,
+            &self.identity,
+            &monitor["specification"],
+        ) {
+            Ok(previous) => previous,
+            Err(error) => {
+                self.reject_status(&error, now);
+                return true;
+            }
         };
-        let Some((width, height, refresh, hdr)) = old_mode() else {
-            self.reject_status("invalid_retained_mode_baseline", now);
-            return true;
-        };
-        if previous["identity"] != self.identity || previous["name"] != "Remote Monitor" {
-            self.reject_status("invalid_retained_mode_baseline", now);
+        if aborted {
+            if previous == self.request {
+                return false;
+            }
+            let wanted = self.request.clone();
+            self.request = previous;
+            if specification_matches(&wanted, &self.identity, &intent["requested_specification"]) {
+                self.failed_mode_request = Some(wanted);
+                self.mode_failure = Some("retained_mode_rejected".into());
+            } else {
+                // A different request may have been persisted after the abort.
+                // First restore the independently observed old source, then
+                // admit that new request against the advanced mode revision.
+                self.queued_mode_request = Some(wanted);
+            }
+            return false;
+        }
+        if !specification_matches(&self.request, &self.identity, &intent["specification"]) {
+            self.reject_status("retained_mode_intent_mismatch", now);
             return true;
         }
         self.desired_request = Some(self.request.clone());
-        self.request.width = width;
-        self.request.height = height;
-        self.request.refresh_millihz = refresh;
-        self.request.hdr_enabled = hdr;
+        self.request = previous;
         self.mode_operation = Some(operation.into());
         self.display_target = monitor["ready"]["device_path"]
             .as_str()
@@ -380,4 +394,38 @@ impl Monitor {
             && specification["hdr_enabled"] == desired.hdr_enabled
             && specification["name"] == "Remote Monitor"
     }
+}
+
+fn specification_matches(request: &MonitorRequest, identity: &str, specification: &Value) -> bool {
+    specification["identity"] == identity
+        && specification["name"] == "Remote Monitor"
+        && specification["width"] == request.width
+        && specification["height"] == request.height
+        && specification["refresh_millihz"] == request.refresh_millihz
+        && specification["hdr_enabled"] == request.hdr_enabled
+}
+
+fn request_from_specification(
+    current: &MonitorRequest,
+    identity: &str,
+    specification: &Value,
+) -> Result<MonitorRequest, String> {
+    let number = |name: &str| {
+        specification[name]
+            .as_u64()
+            .and_then(|number| u32::try_from(number).ok())
+            .ok_or("invalid_retained_mode_baseline")
+    };
+    let mut previous = current.clone();
+    previous.width = number("width")?;
+    previous.height = number("height")?;
+    previous.refresh_millihz = number("refresh_millihz")?;
+    previous.hdr_enabled = specification["hdr_enabled"]
+        .as_bool()
+        .ok_or("invalid_retained_mode_baseline")?;
+    previous.validate()?;
+    if !specification_matches(&previous, identity, specification) {
+        return Err("invalid_retained_mode_baseline".into());
+    }
+    Ok(previous)
 }

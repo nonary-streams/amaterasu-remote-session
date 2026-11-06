@@ -130,6 +130,8 @@ enum Step {
     ModeReconcile,
     ExistingPreflight,
     AbortMode,
+    CompositionStatus,
+    CompositionReconcile,
 }
 
 struct Monitor {
@@ -148,6 +150,8 @@ struct Monitor {
     scope_released: bool,
     scope_cleanup_only: bool,
     observed_retirement: Option<(bool, bool)>,
+    scope_observed: bool,
+    pending_scope: Option<(String, bool)>,
     composition_dirty: bool,
     hdr_followup: bool,
     layout_rules: layout::Layout,
@@ -274,6 +278,9 @@ impl Monitor {
             Step::CompositionSnapshot | Step::CompositionApply | Step::CompositionRelease => {
                 unreachable!("display composition uses its selected service")
             }
+            Step::CompositionStatus | Step::CompositionReconcile => {
+                unreachable!("scope recovery uses public Display SDK")
+            }
             Step::PrepareMode
             | Step::ModeSnapshot
             | Step::ModeApply
@@ -320,6 +327,28 @@ impl Monitor {
             )
         } else {
             match self.step {
+                Step::CompositionStatus => (
+                    amaterasu_module_sdk::display::SERVICE,
+                    amaterasu_module_sdk::display::ScopedOperation::ScopedStatus {
+                        identity: self.identity.clone(),
+                        reference_id: self.source_reference.clone(),
+                    }
+                    .payload()?,
+                ),
+                Step::CompositionReconcile => (
+                    amaterasu_module_sdk::display::SERVICE,
+                    amaterasu_module_sdk::display::ScopedOperation::ScopedReconcile {
+                        operation_id: self
+                            .pending_scope
+                            .as_ref()
+                            .ok_or("scoped_operation_missing")?
+                            .0
+                            .clone(),
+                        identity: self.identity.clone(),
+                        reference_id: self.source_reference.clone(),
+                    }
+                    .payload()?,
+                ),
                 Step::CompositionSnapshot | Step::ModeSnapshot => (
                     amaterasu_module_sdk::display::SERVICE,
                     json!({"action":"snapshot"}),
@@ -407,6 +436,20 @@ impl Monitor {
             Ok(payload) if payload["ok"] == true => payload,
             Ok(payload) => {
                 let code = provider_error_code(&payload);
+                if self.step == Step::CompositionReconcile
+                    && (code == "scoped_operation_not_found"
+                        || code == "scoped_readback_changed"
+                            && self
+                                .pending_scope
+                                .as_ref()
+                                .is_some_and(|(_, pending)| !*pending))
+                {
+                    self.scope_observed = true;
+                    self.pending_scope = None;
+                    self.error = None;
+                    self.schedule(Step::CompositionSnapshot, now, Duration::ZERO);
+                    return;
+                }
                 if self.step == Step::CompositionRelease && code == "target_in_use" {
                     // Another authenticated source owns a protected read-only
                     // reference. Retire this role while retaining the shared
@@ -420,6 +463,13 @@ impl Monitor {
                 self.source_ready = false;
                 self.output = None;
                 self.error = Some(code.into());
+                if matches!(
+                    self.step,
+                    Step::CompositionStatus | Step::CompositionReconcile
+                ) {
+                    self.next_poll = now + RETRY_INTERVAL;
+                    return;
+                }
                 if matches!(self.step, Step::CompositionApply | Step::CompositionRelease) {
                     self.retry_composition(code, now);
                     return;
@@ -441,6 +491,13 @@ impl Monitor {
                 self.source_ready = false;
                 self.output = None;
                 self.error = Some(error);
+                if matches!(
+                    self.step,
+                    Step::CompositionStatus | Step::CompositionReconcile
+                ) {
+                    self.next_poll = now + RETRY_INTERVAL;
+                    return;
+                }
                 if matches!(self.step, Step::CompositionApply | Step::CompositionRelease) {
                     // The native transition may have committed. Its provider
                     // operation identity and exact payload remain unchanged.
@@ -478,7 +535,11 @@ impl Monitor {
         }
         if matches!(
             self.step,
-            Step::CompositionSnapshot | Step::CompositionApply | Step::CompositionRelease
+            Step::CompositionSnapshot
+                | Step::CompositionApply
+                | Step::CompositionRelease
+                | Step::CompositionStatus
+                | Step::CompositionReconcile
         ) {
             self.accept_composition(payload, now);
         } else {
@@ -694,7 +755,52 @@ impl Monitor {
     }
 
     fn accept_composition(&mut self, payload: Value, now: Instant) {
+        if self.step == Step::CompositionStatus {
+            match amaterasu_module_sdk::display::scoped_status_from_reply(
+                payload,
+                &self.identity,
+                &self.source_reference,
+            ) {
+                Ok(status) => {
+                    self.scope_observed = true;
+                    self.pending_scope = status
+                        .operation_id
+                        .map(|operation| (operation, status.pending));
+                    self.schedule(
+                        if self.pending_scope.is_some() {
+                            Step::CompositionReconcile
+                        } else {
+                            Step::CompositionSnapshot
+                        },
+                        now,
+                        Duration::ZERO,
+                    );
+                }
+                Err(error) => self.reject_status(&error, now),
+            }
+            return;
+        }
+        if self.step == Step::CompositionReconcile {
+            if self
+                .pending_scope
+                .as_ref()
+                .is_none_or(|(operation, _)| payload["operation_id"] != *operation)
+                || !matches!(payload["state"].as_str(), Some("succeeded" | "not_applied"))
+            {
+                self.error = Some("scoped_recovery_unconfirmed".into());
+                self.next_poll = now + RETRY_INTERVAL;
+                return;
+            }
+            self.pending_scope = None;
+            self.error = None;
+            self.schedule(Step::CompositionSnapshot, now, Duration::ZERO);
+            return;
+        }
         if self.step == Step::CompositionSnapshot {
+            if !self.scope_observed {
+                self.schedule(Step::CompositionStatus, now, Duration::ZERO);
+                return;
+            }
             let release = self.scope_cleanup_only
                 || self.release_requested && self.reference_released && self.captures.is_empty();
             let target_id = if release {
@@ -1033,6 +1139,8 @@ impl MonitorManager {
             scope_released: false,
             scope_cleanup_only: false,
             observed_retirement: None,
+            scope_observed: false,
+            pending_scope: None,
             composition_dirty: true,
             hdr_followup: false,
             layout_rules: self.layout.clone(),
