@@ -35,13 +35,23 @@ pub struct MonitorRequest {
 }
 
 impl MonitorRequest {
-    fn validate(&self) -> Result<(), String> {
+    fn validate_snapshot(&self) -> Result<(), String> {
         if !valid_identity(&self.profile_id)
-            || !(320..=7680).contains(&self.width)
-            || !(200..=4320).contains(&self.height)
-            || !(1000..=1_000_000).contains(&self.refresh_millihz)
             || !self.profile_settings.is_object()
             || !serde_json::to_vec(&self.profile_settings).is_ok_and(|bytes| bytes.len() <= 16_384)
+        {
+            return Err("invalid_monitor_request".into());
+        }
+        Ok(())
+    }
+
+    fn validate(&self, borrowed_source: bool) -> Result<(), String> {
+        self.validate_snapshot()?;
+        let minimum_width = if borrowed_source { 1 } else { 320 };
+        let minimum_height = if borrowed_source { 1 } else { 200 };
+        if !(minimum_width..=7680).contains(&self.width)
+            || !(minimum_height..=4320).contains(&self.height)
+            || !(1000..=1_000_000).contains(&self.refresh_millihz)
         {
             return Err("invalid_monitor_request".into());
         }
@@ -402,6 +412,9 @@ impl Monitor {
     }
 
     fn request_release(&mut self, now: Instant) {
+        if self.release_requested && !self.effect_stalled {
+            return;
+        }
         if self.effect_stalled {
             // A fresh authenticated release opens one more bounded native
             // cleanup window. Polling alone never resets a provider's budget.
@@ -1044,14 +1057,41 @@ impl MonitorManager {
         request: MonitorRequest,
         now: Instant,
     ) -> Result<MonitorSnapshot, String> {
+        self.admit_owner(client, generation, request, now, false)
+    }
+
+    /// Reconcile only the exact persisted owner's cleanup obligations. Native
+    /// mode admission does not gate retirement of a previously refused request.
+    /// This actor starts in release and cannot create or reconfigure a source.
+    pub fn begin_cleanup(
+        &mut self,
+        client: &str,
+        generation: u64,
+        request: MonitorRequest,
+        now: Instant,
+    ) -> Result<MonitorSnapshot, String> {
+        self.admit_owner(client, generation, request, now, true)
+    }
+
+    fn admit_owner(
+        &mut self,
+        client: &str,
+        generation: u64,
+        request: MonitorRequest,
+        now: Instant,
+        cleanup: bool,
+    ) -> Result<MonitorSnapshot, String> {
         if let Some(error) = &self.startup_error {
             return Err(error.clone());
         }
-        if !valid_identity(client) || generation == 0 || self.shutting_down {
+        if !valid_identity(client) || generation == 0 || self.shutting_down && !cleanup {
             return Err("invalid_monitor_owner".into());
         }
-        request.validate()?;
+        request.validate_snapshot()?;
         let existing = existing::selection(&request.profile_settings)?;
+        if !cleanup {
+            request.validate(existing.is_some())?;
+        }
         if self.monitors.get(client).is_some_and(|existing| {
             existing.reference_released
                 && existing.source_reference_released
@@ -1062,6 +1102,10 @@ impl MonitorManager {
         if let Some(existing) = self.monitors.get_mut(client) {
             if existing.generation != generation {
                 return Err("monitor_generation_conflict".into());
+            }
+            if cleanup {
+                existing.request_release(now);
+                return Ok(existing.snapshot());
             }
             if let Some(failed) = &existing.failed_mode_request {
                 if failed == &request {
@@ -1184,7 +1228,7 @@ impl MonitorManager {
             mode_failure: None,
             queued_mode_request: None,
             layout: Some(VirtualDisplayLayout::Extended),
-            step: Step::Inspect,
+            step: if cleanup { Step::Remove } else { Step::Inspect },
             call: None,
             serial: 0,
             next_poll: now,
@@ -1192,7 +1236,7 @@ impl MonitorManager {
             source_ready: false,
             output: None,
             error: None,
-            release_requested: false,
+            release_requested: cleanup,
             reference_released: false,
             parked: false,
             native_retired: false,

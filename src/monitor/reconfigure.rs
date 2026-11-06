@@ -423,7 +423,7 @@ fn request_from_specification(
     previous.hdr_enabled = specification["hdr_enabled"]
         .as_bool()
         .ok_or("invalid_retained_mode_baseline")?;
-    previous.validate()?;
+    previous.validate(false)?;
     if !specification_matches(&previous, identity, specification) {
         return Err("invalid_retained_mode_baseline".into());
     }

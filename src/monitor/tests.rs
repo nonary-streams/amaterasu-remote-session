@@ -431,6 +431,121 @@ fn refused_launch_retires_without_desktop_access_after_exact_absence_proofs() {
 }
 
 #[test]
+fn persisted_refusal_cleanup_does_not_require_an_admissible_native_mode() {
+    for (width, height, refresh_millihz) in [(64, 48, 30_000), (0, 0, 0), (u32::MAX, u32::MAX, 1)] {
+        let now = Instant::now();
+        let mut manager = MonitorManager::new(MonitorSettings::default());
+        let mut provider = Provider {
+            desktop_unavailable: true,
+            ..Provider::default()
+        };
+        let mut rejected = request();
+        rejected.width = width;
+        rejected.height = height;
+        rejected.refresh_millihz = refresh_millihz;
+        assert_eq!(
+            manager
+                .begin("alice", 3, rejected.clone(), now)
+                .unwrap_err(),
+            "invalid_monitor_request"
+        );
+        assert!(manager.snapshot("alice").is_none());
+        manager
+            .begin_cleanup("alice", 3, rejected.clone(), now)
+            .unwrap();
+        assert_eq!(manager.monitors["alice"].request, rejected);
+        tick(&mut manager, &mut provider, now);
+        let snapshot = manager.snapshot("alice").unwrap();
+        assert!(snapshot.reference_released && snapshot.source_reference_released);
+        assert!(snapshot.native_retired && !snapshot.cleanup_pending);
+        assert!(!provider.observed.iter().any(|operation| matches!(
+            operation["action"].as_str(),
+            Some("create" | "snapshot" | "scoped_apply" | "prepare_retained_mode")
+        )));
+    }
+}
+
+#[test]
+fn cleanup_admission_keeps_generation_fences_and_live_capture_obligations() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider::default();
+    ready(&mut manager, &mut provider, now);
+    manager.capture_started("alice", 3, "live-source").unwrap();
+    let mut refused = request();
+    refused.width = 64;
+    refused.height = 48;
+    assert_eq!(
+        manager
+            .begin_cleanup("alice", 2, refused.clone(), now)
+            .unwrap_err(),
+        "monitor_generation_conflict"
+    );
+    manager.begin_cleanup("alice", 3, refused, now).unwrap();
+    assert_eq!(manager.monitors["alice"].request, request());
+    tick(&mut manager, &mut provider, now + RETRY_INTERVAL);
+    let snapshot = manager.snapshot("alice").unwrap();
+    assert!(snapshot.reference_released);
+    assert!(!snapshot.source_reference_released);
+    assert!(snapshot.source_ready);
+    assert_eq!(provider.references.len(), 1);
+    assert!(provider.scope_reference_owned);
+}
+
+#[test]
+fn repeated_cleanup_admission_does_not_reset_native_reconciliation_progress() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider {
+        desktop_unavailable: true,
+        ..Provider::default()
+    };
+    let mut refused = request();
+    refused.width = 64;
+    refused.height = 48;
+    for _ in 0..96 {
+        manager
+            .begin_cleanup("alice", 3, refused.clone(), now)
+            .unwrap();
+        manager.release("alice", 3, now).unwrap();
+        manager
+            .tick(now, &mut |command| provider.send(command))
+            .unwrap();
+    }
+    assert!(manager.snapshot("alice").unwrap().source_reference_released);
+    assert!(!manager.has_pending_cleanup());
+    assert_eq!(
+        provider
+            .observed
+            .iter()
+            .filter(|operation| operation["action"] == "remove")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn small_encoded_mode_does_not_reject_a_valid_existing_native_source() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider::default();
+    let mut encoded = request();
+    encoded.width = 64;
+    encoded.height = 48;
+    encoded.profile_settings =
+        json!({"monitor_target":{"kind":"existing","selector":"display-target:approved"}});
+    manager.begin("alice", 3, encoded, now).unwrap();
+    tick(&mut manager, &mut provider, now);
+    let snapshot = manager.snapshot("alice").unwrap();
+    assert!(snapshot.ready);
+    assert_eq!(snapshot.source_mode.unwrap().width, provider.physical_width);
+    assert!(!provider.observed.iter().any(|operation| matches!(
+        operation["action"].as_str(),
+        Some("create" | "scoped_apply" | "prepare_retained_mode")
+    )));
+}
+
+#[test]
 fn unapplied_owned_scope_is_not_absence_proof_without_native_observation() {
     let now = Instant::now();
     let mut manager = MonitorManager::new(MonitorSettings::default());
