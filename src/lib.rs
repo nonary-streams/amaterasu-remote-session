@@ -511,7 +511,10 @@ impl RemoteSessionModule {
         }
         if (self.shutting_down && !cleanup)
             || !self.restored
-            || !self.preferences.is_ready()
+            // Restoring the policy already required a successful settings and
+            // journal read. Cleanup continues against that retained snapshot
+            // after those readers drain, while other modules finish shutdown.
+            || (!cleanup && !self.preferences.is_ready())
             || self.persistence_error.is_some()
             || (!cleanup && !self.membership.ready_for(&self.policy.authority_clients()))
         {

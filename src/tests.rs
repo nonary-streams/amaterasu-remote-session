@@ -7,6 +7,9 @@ use std::{
     ffi::c_void,
 };
 
+#[cfg(feature = "core-integration-tests")]
+mod broker_shutdown;
+
 struct Outbound {
     service: String,
     payload: Value,
