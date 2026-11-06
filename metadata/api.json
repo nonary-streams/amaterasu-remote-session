@@ -1,0 +1,24 @@
+[
+  {
+    "service": "nonary.remote-session/1",
+    "method": "settings_get",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.remote-session/1",
+    "method": "settings_update",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {"settings": "object", "expected_revision": "integer"},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": true},
+    "privilege": "user"
+  }
+]
