@@ -4,8 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[package.metadata.amaterasu.standalone]
+core-test-dependencies = ["amaterasu-state", "amaterasu-runtime"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["core-integration-tests"]
+core-integration-tests = []
 
 [dependencies]
 amaterasu-module-sdk.workspace = true
@@ -16,6 +23,7 @@ getrandom.workspace = true
 
 [dev-dependencies]
 amaterasu-state = { path = "../state", features = ["test-support"] }
+amaterasu-runtime = { path = "../../crates/runtime" }
 
 [lints]
 workspace = true

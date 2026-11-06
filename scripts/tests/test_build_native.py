@@ -80,6 +80,34 @@ class StandaloneManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no unique SDK path dependency"):
             build_native.standalone_manifest(self.plugin, self.sdk)
 
+    def test_only_declared_core_test_dependencies_are_omitted(self):
+        with (self.plugin / "Cargo.toml").open("a") as source:
+            source.write(
+                '\n[package.metadata.amaterasu.standalone]\n'
+                'core-test-dependencies=["state","runtime"]\n'
+                '[features]\ndefault=["core-integration-tests","other"]\n'
+                'core-integration-tests=[]\nother=[]\n'
+                '[dev-dependencies]\nstate={path="../state"}\n'
+                '[target.\'cfg(windows)\'.dev-dependencies]\nruntime={path="../runtime"}\n'
+            )
+        original = (self.plugin / "Cargo.toml").read_bytes()
+        manifest = build_native.standalone_manifest(self.plugin, self.sdk)
+        self.assertEqual(manifest["dev-dependencies"], {})
+        self.assertEqual(manifest["target"]["cfg(windows)"]["dev-dependencies"], {})
+        self.assertEqual(manifest["features"]["default"], ["other"])
+        self.assertEqual(manifest["features"]["core-integration-tests"], [])
+        self.assertEqual((self.plugin / "Cargo.toml").read_bytes(), original)
+
+    def test_core_test_metadata_cannot_omit_production_dependencies(self):
+        with (self.plugin / "Cargo.toml").open("a") as source:
+            source.write(
+                '\n[package.metadata.amaterasu.standalone]\n'
+                'core-test-dependencies=["sdk"]\n'
+                '[features]\ncore-integration-tests=[]\n'
+            )
+        with self.assertRaisesRegex(ValueError, "declared dev-dependencies"):
+            build_native.standalone_manifest(self.plugin, self.sdk)
+
 
 if __name__ == "__main__":
     unittest.main()

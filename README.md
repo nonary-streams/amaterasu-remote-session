@@ -33,6 +33,10 @@ npm test
 npm run build
 ```
 
+The standalone helper omits explicitly marked core provider integration tests.
+The parent workspace enables `core-integration-tests` by default, retaining the
+real State journal and broker regressions alongside the standalone unit tests.
+
 When checked out at `modules/remote-session`, the parent Cargo workspace builds
 the same native library as `amaterasu-remote-session`. The independent
 `amaterasu-capture-black` component supplies black pixels through the standard

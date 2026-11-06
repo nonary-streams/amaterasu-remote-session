@@ -13,6 +13,7 @@ import tomllib
 
 
 DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
+CORE_TEST_FEATURE = "core-integration-tests"
 
 
 def read_manifest(path):
@@ -91,12 +92,41 @@ def resolve_dependency(name, dependency, repository, sdk_root, workspace):
     return dependency
 
 
+def omit_core_integration_tests(manifest):
+    """Core provider regressions stay in the core workspace, outside the SDK."""
+    metadata = manifest.get("package", {}).get("metadata", {})
+    standalone = metadata.get("amaterasu", {}).get("standalone", {})
+    core_dependencies = standalone.get("core-test-dependencies", [])
+    if not isinstance(core_dependencies, list) or any(
+        not isinstance(name, str) or not name for name in core_dependencies
+    ) or len(set(core_dependencies)) != len(core_dependencies):
+        raise ValueError("core-test-dependencies must list distinct dependency names")
+    if not core_dependencies:
+        return
+    features = manifest.get("features", {})
+    if features.get(CORE_TEST_FEATURE) != []:
+        raise ValueError(f"core test dependencies require the empty {CORE_TEST_FEATURE} feature")
+    removed = set()
+    for table in [manifest, *manifest.get("target", {}).values()]:
+        dependencies = table.get("dev-dependencies", {})
+        for name in core_dependencies:
+            if name in dependencies:
+                del dependencies[name]
+                removed.add(name)
+    if removed != set(core_dependencies):
+        raise ValueError("core-test-dependencies must name declared dev-dependencies")
+    features["default"] = [
+        name for name in features.get("default", []) if name != CORE_TEST_FEATURE
+    ]
+
+
 def standalone_manifest(repository, sdk_root):
     manifest = read_manifest(repository / "Cargo.toml")
     workspace = read_manifest(sdk_root / "Cargo.toml").get("workspace", {})
     package = manifest.get("package")
     if not isinstance(package, dict) or package.get("name") != "amaterasu-remote-session":
         raise ValueError("plugin manifest must declare amaterasu-remote-session")
+    omit_core_integration_tests(manifest)
     for key, value in list(package.items()):
         if isinstance(value, dict) and value.get("workspace") is True:
             inherited = workspace.get("package", {}).get(key)

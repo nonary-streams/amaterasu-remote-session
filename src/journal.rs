@@ -484,6 +484,6 @@ fn state_error(payload: &Value) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "core-integration-tests"))]
 #[path = "journal/tests.rs"]
 mod tests;
