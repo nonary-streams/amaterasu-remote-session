@@ -33,6 +33,8 @@ struct Provider {
     target_unavailable: bool,
     scope_status_operation: Option<String>,
     scope_status_pending: bool,
+    scope_reference_owned: bool,
+    desktop_unavailable: bool,
     last_scope_request: Option<Value>,
 }
 
@@ -69,6 +71,8 @@ impl Default for Provider {
             target_unavailable: false,
             scope_status_operation: None,
             scope_status_pending: false,
+            scope_reference_owned: false,
+            desktop_unavailable: false,
             last_scope_request: None,
         }
     }
@@ -267,6 +271,9 @@ impl Provider {
                 json!({"ok":true,"released":true,"native_removed":false,"selector":payload["selector"],"reference_id":payload["reference_id"]})
             }
             "snapshot" => {
+                if self.desktop_unavailable {
+                    return json!({"ok":false,"error":{"code":"desktop_unavailable","message":"no native desktop observation"}});
+                }
                 let mut displays = vec![
                     json!({"id":"physical-one","width":1920,"height":1080,"refresh":{"numerator":60000,"denominator":1000},"x":0,"y":0,"rotation":"identity","hdr_enabled":false}),
                 ];
@@ -277,6 +284,8 @@ impl Provider {
             }
             "scoped_apply" => {
                 self.last_scope_request = Some(payload.clone());
+                self.scope_reference_owned = true;
+                self.scope_status_operation = payload["operation_id"].as_str().map(str::to_owned);
                 let reconciled = !self
                     .applied_display_ops
                     .insert(payload["operation_id"].as_str().unwrap().into());
@@ -293,6 +302,9 @@ impl Provider {
                 if self.external_borrow {
                     return json!({"ok":false,"error":{"code":"target_in_use","message":"existing source consumers retain this target"}});
                 }
+                self.scope_reference_owned = false;
+                self.scope_status_operation = None;
+                self.scope_status_pending = false;
                 json!({"ok":true,"released":true,"native_removed":false,"operation_id":payload["operation_id"],"target_id":"Virtual-7"})
             }
             "scoped_reconfigure" => {
@@ -320,7 +332,7 @@ impl Provider {
                 }
             }
             "scoped_status" => {
-                json!({"ok":true,"identity":payload["identity"],"reference_id":payload["reference_id"],"operation_id":self.scope_status_operation,"pending":self.scope_status_pending})
+                json!({"ok":true,"identity":payload["identity"],"reference_id":payload["reference_id"],"reference_owned":self.scope_reference_owned,"operation_id":self.scope_status_operation,"pending":self.scope_status_pending})
             }
             _ => panic!("unknown display operation"),
         }
@@ -381,6 +393,125 @@ fn ready(manager: &mut MonitorManager, provider: &mut Provider, now: Instant) {
     provider.state = "ready";
     tick(manager, provider, now + RETRY_INTERVAL);
     assert!(manager.snapshot("alice").unwrap().ready);
+}
+
+#[test]
+fn refused_launch_retires_without_desktop_access_after_exact_absence_proofs() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider {
+        desktop_unavailable: true,
+        ..Provider::default()
+    };
+    manager.begin("alice", 3, request(), now).unwrap();
+    manager.release("alice", 3, now).unwrap();
+    tick(&mut manager, &mut provider, now);
+    let snapshot = manager.snapshot("alice").unwrap();
+    assert!(snapshot.reference_released);
+    assert!(snapshot.source_reference_released);
+    assert!(snapshot.native_retired);
+    assert!(!snapshot.cleanup_pending);
+    assert!(!manager.has_pending_cleanup());
+    let monitor = &manager.monitors["alice"];
+    for reference in [&monitor.reference, &monitor.source_reference] {
+        assert!(provider.observed.iter().any(|operation| {
+            operation["action"] == "status" && operation["reference_id"] == *reference
+        }));
+    }
+    assert!(provider.observed.iter().any(|operation| {
+        operation["action"] == "scoped_status"
+            && operation["reference_id"] == monitor.source_reference
+    }));
+    assert!(!provider.observed.iter().any(|operation| matches!(
+        operation["action"].as_str(),
+        Some("create" | "snapshot" | "scoped_apply" | "scoped_release")
+    )));
+    assert!(provider.calls.is_empty());
+    assert!(provider.references.is_empty());
+}
+
+#[test]
+fn unapplied_owned_scope_is_not_absence_proof_without_native_observation() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider {
+        scope_reference_owned: true,
+        desktop_unavailable: true,
+        ..Provider::default()
+    };
+    manager.begin("alice", 3, request(), now).unwrap();
+    manager.release("alice", 3, now).unwrap();
+    for elapsed in 0..3 {
+        tick(&mut manager, &mut provider, now + RETRY_INTERVAL * elapsed);
+    }
+    let snapshot = manager.snapshot("alice").unwrap();
+    assert!(snapshot.reference_released);
+    assert!(!snapshot.source_reference_released);
+    assert!(snapshot.cleanup_pending);
+    assert!(manager.has_pending_cleanup());
+    assert!(provider.scope_reference_owned);
+    assert!(provider.scope_status_operation.is_none());
+    let status = provider
+        .observed
+        .iter()
+        .position(|operation| operation["action"] == "scoped_status")
+        .unwrap();
+    let snapshot = provider
+        .observed
+        .iter()
+        .position(|operation| operation["action"] == "snapshot")
+        .unwrap();
+    assert!(status < snapshot);
+}
+
+#[test]
+fn disconnect_waits_for_in_flight_placement_then_retires_its_actual_scope() {
+    let now = Instant::now();
+    let mut manager = MonitorManager::new(MonitorSettings::default());
+    let mut provider = Provider::default();
+    manager.begin("alice", 3, request(), now).unwrap();
+    for _ in 0..96 {
+        if provider.specification.is_some() {
+            provider.state = "ready";
+        }
+        manager
+            .tick(now + RETRY_INTERVAL, &mut |command| provider.send(command))
+            .unwrap();
+        if provider.scope_reference_owned {
+            break;
+        }
+    }
+    assert!(provider.scope_reference_owned);
+    assert!(manager.monitors["alice"].call.is_some());
+    assert!(!manager.monitors["alice"].scope_released);
+    assert!(!manager.monitors["alice"].scope_observed);
+    provider.pending = true;
+    manager.release("alice", 3, now + RETRY_INTERVAL).unwrap();
+    tick(&mut manager, &mut provider, now + RETRY_INTERVAL);
+    let snapshot = manager.snapshot("alice").unwrap();
+    assert!(!snapshot.source_reference_released);
+    assert!(snapshot.cleanup_pending);
+    assert!(provider.scope_reference_owned);
+    assert!(
+        !provider
+            .observed
+            .iter()
+            .any(|operation| operation["action"] == "scoped_release")
+    );
+
+    provider.pending = false;
+    tick(&mut manager, &mut provider, now + RETRY_INTERVAL);
+    assert!(provider.remove_requested);
+    provider.specification = None;
+    tick(&mut manager, &mut provider, now + RETRY_INTERVAL * 2);
+    assert!(manager.snapshot("alice").unwrap().source_reference_released);
+    assert!(!provider.scope_reference_owned);
+    assert!(
+        provider
+            .observed
+            .iter()
+            .any(|operation| operation["action"] == "scoped_release")
+    );
 }
 
 #[test]

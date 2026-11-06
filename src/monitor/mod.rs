@@ -304,6 +304,12 @@ impl Monitor {
     }
 
     fn queue(&mut self, now: Instant) -> Result<(), String> {
+        if self.step == Step::CompositionSnapshot && !self.scope_observed {
+            // Durable admission discovery needs no desktop access. In
+            // particular, cleanup of a refused launch must not depend on a
+            // global native snapshot before learning whether it owned a scope.
+            self.step = Step::CompositionStatus;
+        }
         match self.step {
             Step::Create | Step::CreateSource => {
                 self.create_attempts = self.create_attempts.saturating_add(1)
@@ -372,6 +378,12 @@ impl Monitor {
                 ),
             }
         };
+        if self.step == Step::CompositionApply {
+            // A new admission supersedes every earlier absence proof, even
+            // when its broker acknowledgement or native completion is lost.
+            self.scope_released = false;
+            self.scope_observed = false;
+        }
         self.call = Some(Call::new(
             service,
             payload,
@@ -766,6 +778,17 @@ impl Monitor {
                     self.pending_scope = status
                         .operation_id
                         .map(|operation| (operation, status.pending));
+                    if !status.reference_owned {
+                        self.scope_reserved = false;
+                        self.scope_released = true;
+                        if self.captures.is_empty()
+                            && (self.scope_cleanup_only
+                                || self.release_requested && self.reference_released)
+                        {
+                            self.complete_scope_release(now);
+                            return;
+                        }
+                    }
                     self.schedule(
                         if self.pending_scope.is_some() {
                             Step::CompositionReconcile
@@ -877,31 +900,36 @@ impl Monitor {
             {
                 self.scope_reserved = true;
                 self.scope_released = false;
+                self.scope_observed = true;
                 self.composition_dirty = self.hdr_followup;
                 self.schedule(Step::InspectSource, now, Duration::ZERO);
             }
             Step::CompositionRelease if payload["released"] == true => {
-                self.scope_reserved = false;
-                self.scope_released = true;
-                self.external_borrowed = false;
-                if self.observed_retirement.is_some() {
-                    self.finish_retirement();
-                } else if self.scope_cleanup_only {
-                    self.scope_cleanup_only = false;
-                    self.schedule(
-                        if self.release_requested {
-                            Step::Remove
-                        } else {
-                            Step::Create
-                        },
-                        now,
-                        Duration::ZERO,
-                    );
-                } else {
-                    self.schedule(Step::RemoveSource, now, Duration::ZERO);
-                }
+                self.complete_scope_release(now);
             }
             _ => self.reject_status("display_composition_unconfirmed", now),
+        }
+    }
+
+    fn complete_scope_release(&mut self, now: Instant) {
+        self.scope_reserved = false;
+        self.scope_released = true;
+        self.external_borrowed = false;
+        if self.observed_retirement.is_some() {
+            self.finish_retirement();
+        } else if self.scope_cleanup_only {
+            self.scope_cleanup_only = false;
+            self.schedule(
+                if self.release_requested {
+                    Step::Remove
+                } else {
+                    Step::Create
+                },
+                now,
+                Duration::ZERO,
+            );
+        } else {
+            self.schedule(Step::RemoveSource, now, Duration::ZERO);
         }
     }
 
