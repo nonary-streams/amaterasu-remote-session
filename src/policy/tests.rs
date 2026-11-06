@@ -1,6 +1,8 @@
 use super::*;
 use amaterasu_module_sdk::session_presentation::{Client, Game};
 
+mod admission;
+
 #[derive(Default)]
 struct TestMonitors {
     states: BTreeMap<String, MonitorStatus>,

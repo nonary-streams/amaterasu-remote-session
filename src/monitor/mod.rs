@@ -35,6 +35,13 @@ pub struct MonitorRequest {
 }
 
 impl MonitorRequest {
+    /// Validate a new source without admitting ownership or native operations.
+    /// Existing targets keep their source mode independent of encoding size.
+    pub fn validate_admission(&self) -> Result<(), String> {
+        self.validate_snapshot()?;
+        self.validate(existing::selection(&self.profile_settings)?.is_some())
+    }
+
     fn validate_snapshot(&self) -> Result<(), String> {
         if !valid_identity(&self.profile_id)
             || !self.profile_settings.is_object()

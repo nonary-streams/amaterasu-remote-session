@@ -59,6 +59,14 @@ impl SessionPolicy {
                 Ok(mode) => mode,
                 Err(code) => return (Some(reject(400, code)), false),
             };
+            if let Err(code) = validate_monitor_admission(
+                role,
+                &owner.profile_id,
+                desired_mode,
+                &owner.profile_settings,
+            ) {
+                return (Some(reject(400, &code)), false);
+            }
             if owner.mode != desired_mode {
                 if !owner.reservations.is_empty() {
                     return (
@@ -84,6 +92,26 @@ impl SessionPolicy {
                     false,
                 );
             }
+            let profile_settings = configured
+                .filter(|application| application.monitor_profile)
+                .map(|application| application.properties.clone())
+                .unwrap_or_else(|| json!({}));
+            let mode = match resolve_profile_mode(mode, &profile_settings) {
+                Ok(mode) => mode,
+                Err(code) => return (Some(reject(400, code)), false),
+            };
+            let profile_id = requested_profile.unwrap_or_else(|| {
+                if role == Role::Monitor {
+                    Control::Monitor.uuid()
+                } else {
+                    Control::Input.uuid()
+                }
+            });
+            if let Err(code) =
+                validate_monitor_admission(role, &profile_id, mode, &profile_settings)
+            {
+                return (Some(reject(400, &code)), false);
+            }
             let generation = self.desired.next_generation;
             let Some(next) = generation.checked_add(1) else {
                 return (
@@ -93,14 +121,6 @@ impl SessionPolicy {
             };
             self.desired.next_generation = next;
             let session_id = owner_session_id(caller, client, operation, generation);
-            let profile_settings = configured
-                .filter(|application| application.monitor_profile)
-                .map(|application| application.properties.clone())
-                .unwrap_or_else(|| json!({}));
-            let mode = match resolve_profile_mode(mode, &profile_settings) {
-                Ok(mode) => mode,
-                Err(code) => return (Some(reject(400, code)), false),
-            };
             self.desired.owners.push(RetainedOwner {
                 client_id: client.clone(),
                 consumer: caller.into(),
@@ -110,13 +130,7 @@ impl SessionPolicy {
                 role_active: true,
                 role_committed: false,
                 mode,
-                profile_id: requested_profile.unwrap_or_else(|| {
-                    if role == Role::Monitor {
-                        Control::Monitor.uuid()
-                    } else {
-                        Control::Input.uuid()
-                    }
-                }),
+                profile_id,
                 profile_settings,
                 release_requested: false,
                 reservations: Vec::new(),
@@ -187,4 +201,24 @@ impl SessionPolicy {
         };
         (Some(Decision::Auxiliary { plan }), created)
     }
+}
+
+fn validate_monitor_admission(
+    role: Role,
+    profile_id: &str,
+    mode: Mode,
+    profile_settings: &Value,
+) -> Result<(), String> {
+    if role == Role::Input {
+        return Ok(());
+    }
+    crate::monitor::MonitorRequest {
+        profile_id: profile_id.into(),
+        width: mode.width,
+        height: mode.height,
+        refresh_millihz: mode.refresh_millihz,
+        hdr_enabled: mode.hdr,
+        profile_settings: profile_settings.clone(),
+    }
+    .validate_admission()
 }
