@@ -1,0 +1,84 @@
+name: Remote Session plugin
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read exact SDK revision
+        id: sdk
+        shell: bash
+        run: |
+          revision=$(cat sdk-revision)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: nonary-streams/amaterasu-sdk
+          ref: ${{ steps.sdk.outputs.revision }}
+          path: .sdk
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: python -m unittest discover -s scripts/tests -v
+      - run: python scripts/build-native.py .sdk --fmt
+      - run: python scripts/build-native.py .sdk --test
+      - run: python scripts/build-native.py .sdk --clippy
+      - run: python scripts/build-native.py .sdk --release
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read exact SDK revision
+        id: sdk
+        shell: bash
+        run: |
+          revision=$(cat sdk-revision)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: nonary-streams/amaterasu-sdk
+          ref: ${{ steps.sdk.outputs.revision }}
+          path: .sdk
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm test
+        working-directory: ui
+        env:
+          AMATERASU_SDK: ${{ github.workspace }}/.sdk
+      - run: npm run build
+        working-directory: ui
+        env:
+          AMATERASU_SDK: ${{ github.workspace }}/.sdk
+      - name: Check committed UI assets
+        run: git diff --exit-code -- ui/dist

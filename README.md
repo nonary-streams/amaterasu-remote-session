@@ -1,5 +1,11 @@
 # Remote Monitor and Remote Input
 
+The independently maintained [Remote Session repository](https://github.com/nonary-streams/amaterasu-remote-session)
+is included by default in [Amaterasu](https://github.com/nonary-streams/amaterasu)
+as the pinned `modules/remote-session` core plugin. Source availability and
+default inclusion do not enable display mutation, host input injection or remote
+listeners; those permissions remain explicit package settings.
+
 This native Amaterasu plugin supplies per-client session controls and catalog
 presentation through the public `nonary.session-presentation/1` SDK contract.
 The NVHTTP consumer uses that same versioned contract with replacement providers.
@@ -16,9 +22,13 @@ Launch authorization is evaluated again when a control is used.
 
 ## Build independently
 
-The plugin requires a current Amaterasu SDK checkout containing the session
-presentation contract. An SDK dependency path is resolved by package identity;
-the build helper does not rewrite either source checkout. Set the target
+The plugin requires an [Amaterasu SDK](https://github.com/nonary-streams/amaterasu-sdk)
+checkout at the exact commit recorded in `sdk-revision`. This pin is shared by
+native and UI CI checks. The reviewed SDK pin is
+`800e1c6e4e20c2f949b3438af27f2f080caa10d6`. Check out that revision before using
+the build helper.
+An SDK dependency path is resolved by package identity; the build helper does
+not rewrite either source checkout. Set the target
 directory to a build volume before running it:
 
 ```sh
@@ -28,10 +38,16 @@ python3 scripts/build-native.py /path/to/amaterasu --clippy
 python3 scripts/build-native.py /path/to/amaterasu --fmt
 python3 scripts/build-native.py /path/to/amaterasu --release
 cd ui
+export AMATERASU_SDK=/path/to/amaterasu-sdk
 npm ci
 npm test
 npm run build
 ```
+
+Run `python3 -m unittest discover -s scripts/tests -v` to check the standalone
+manifest helper. Independent CI checks native formatting, portable tests, Clippy
+with warnings denied, UI type checking, UI tests and reproducible UI assets
+against the pinned SDK.
 
 The standalone helper omits explicitly marked core provider integration tests.
 The parent workspace enables `core-integration-tests` by default, retaining the
@@ -133,10 +149,11 @@ documentation. Building this repository does not install or publish it.
 
 ## Qualification
 
-See the parent project's `docs/remote-session-plugin.md` for the behavior and
-verification boundaries. Stateful provider, protocol and composition tests cover
-source behavior. Native display creation/restoration, real client reconnects,
-controller feedback, HDR and playback require qualification on each target
+See the parent project's [Remote Session documentation](https://github.com/nonary-streams/amaterasu/blob/main/docs/remote-session-plugin.md)
+for the behavior and verification boundaries. Stateful provider, protocol and
+composition tests cover source behavior. Native display creation/restoration,
+real client reconnects, controller feedback, HDR and playback require
+qualification on each target
 platform. A retained ownership record alone is not proof of a native resource,
 and successful input admission is not proof that a remote client received data.
 
@@ -154,3 +171,8 @@ disabled. Its full mode decodes the black stream and checks held-input cleanup;
 `--loader-only` checks module loading and contract identity. Both operate on
 explicit build artifacts and a private build-volume test root, never an
 installed service or publisher key.
+
+## License and history
+
+Licensed under [MIT](LICENSE). [Source provenance](PROVENANCE.md) records the
+history-preserving extraction and exact originating feature commit.
