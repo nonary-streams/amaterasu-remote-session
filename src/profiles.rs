@@ -10,12 +10,14 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
+use std::time::{Duration, Instant};
 
 const CATALOG: &str = "amaterasu.catalog/1";
 const DISPLAY: &str = "amaterasu.display/1";
 const MAX_PENDING: usize = 32;
 const DEFAULT_PAGE_LIMIT: usize = 16;
 const PAGE_QUERY: &str = "remote_monitor_profiles";
+const REQUEST_RETENTION: Duration = Duration::from_secs(300);
 
 #[path = "profiles/model.rs"]
 mod model;
@@ -55,8 +57,17 @@ enum Purpose {
     Targets,
 }
 
+impl Purpose {
+    fn is_read_only(&self) -> bool {
+        // ProfileList explicitly avoids catalog migration, and capture_targets
+        // only observes display inventory. Upsert and delete can commit writes.
+        matches!(self, Self::Page { .. } | Self::Targets)
+    }
+}
+
 enum Call {
-    Submit { attempted: bool },
+    Submit,
+    Lookup { first_sent: Option<Instant> },
     Waiting(u64),
     Cancelling(u64),
     Releasing { request: u64, payload: Value },
@@ -201,7 +212,7 @@ impl ProfileManager {
             service,
             payload,
             operation_id,
-            call: Call::Submit { attempted: false },
+            call: Call::Submit,
             abandoned: false,
         });
         Ok(())
@@ -243,17 +254,17 @@ impl ProfileManager {
                 }
             }
         }
-        let state = std::mem::replace(&mut pending.call, Call::Submit { attempted: false });
+        let state = std::mem::replace(&mut pending.call, Call::Submit);
         let mut completed = None;
         match state {
-            Call::Submit { attempted: false } if pending.abandoned => {
+            Call::Submit if pending.abandoned => {
                 completed = Some(failure(
                     "request_ended",
                     "profile request ended before admission",
                 ))
             }
-            Call::Submit { .. } => {
-                pending.call = Call::Submit { attempted: true };
+            Call::Submit => {
+                let first_sent = Instant::now();
                 match send(Command::Request {
                     service: pending.service.into(),
                     payload: pending.payload.clone(),
@@ -261,31 +272,57 @@ impl ProfileManager {
                     operation_id: pending.operation_id.clone(),
                     parent: Some(pending.parent),
                 }) {
-                    Ok(Response::Accepted { id }) => {
-                        pending.call = if pending.abandoned {
-                            Call::Cancelling(id)
-                        } else {
-                            Call::Waiting(id)
-                        }
-                    }
-                    Ok(Response::Error { code, message }) => {
+                    Ok(Response::Accepted { id }) => pending.call = Call::Waiting(id),
+                    Ok(Response::Error { code, message }) if code != "conflict" => {
                         completed = Some(failure(&code, &message))
                     }
-                    Ok(_) | Err(_) => {}
+                    Ok(Response::Error { .. }) => pending.call = Call::Lookup { first_sent: None },
+                    Ok(_) | Err(_) => {
+                        pending.call = Call::Lookup {
+                            first_sent: Some(first_sent),
+                        }
+                    }
                 }
             }
-            Call::Waiting(request) if pending.abandoned => pending.call = Call::Cancelling(request),
+            Call::Lookup { first_sent } => {
+                pending.call = Call::Lookup { first_sent };
+                match send(Command::LookupRequest {
+                    service: pending.service.into(),
+                    payload: pending.payload.clone(),
+                    operation_id: pending.operation_id.clone(),
+                    parent: Some(pending.parent),
+                }) {
+                    Ok(Response::Accepted { id }) => pending.call = Call::Waiting(id),
+                    Ok(Response::Error { code, .. })
+                        if code == "not_found"
+                            && first_sent
+                                .is_some_and(|sent| sent.elapsed() < REQUEST_RETENTION) =>
+                    {
+                        completed = Some(failure(
+                            "request_unavailable",
+                            "profile request was not admitted",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Call::Waiting(request) if pending.abandoned && pending.purpose.is_read_only() => {
+                pending.call = Call::Cancelling(request)
+            }
             Call::Waiting(request) => {
                 pending.call = Call::Waiting(request);
                 match send(Command::TakeResult { request }) {
                     Ok(Response::Result { payload }) => {
                         pending.call = Call::Releasing { request, payload }
                     }
-                    Ok(Response::Error { code, message }) if code == "not_found" => {
+                    Ok(Response::Error { code, message })
+                        if code == "not_found" && pending.purpose.is_read_only() =>
+                    {
                         completed = Some(failure(&code, &message))
                     }
                     Ok(Response::Error { code, message })
-                        if matches!(code.as_str(), "cancelled" | "deadline_exceeded") =>
+                        if pending.purpose.is_read_only()
+                            && matches!(code.as_str(), "cancelled" | "deadline_exceeded") =>
                     {
                         pending.call = Call::Releasing {
                             request,

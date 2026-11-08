@@ -3,10 +3,12 @@
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 const STATE: &str = "amaterasu.state/1";
 const KEY: &str = "remote-session.owner-journal.v1";
 const TIMEOUT_MS: u64 = 30_000;
+const LOOKUP_RETENTION: Duration = Duration::from_secs(300);
 const MAX_DOCUMENT_BYTES: usize = 15 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 16_384;
 const MAX_OWNERS: usize = 32;
@@ -41,6 +43,7 @@ struct PendingCall {
     payload: Value,
     operation_id: String,
     state: CallState,
+    first_sent: Option<Instant>,
 }
 
 pub struct OwnerJournal {
@@ -68,6 +71,7 @@ impl OwnerJournal {
                 payload: json!({"action":"get","key":KEY}),
                 operation_id: format!("remote-session.journal.load.{startup_id}.0"),
                 state: CallState::Submit { attempted: false },
+                first_sent: None,
             }),
             completion: None,
             last_error: None,
@@ -117,6 +121,7 @@ impl OwnerJournal {
             payload,
             operation_id: self.next_operation_id("store")?,
             state: CallState::Submit { attempted: false },
+            first_sent: None,
         };
         self.ready = false;
         self.pending = Some(pending);
@@ -143,29 +148,57 @@ impl OwnerJournal {
             CallState::Submit { attempted: false } if self.shutting_down => {
                 finished = Some(Outcome::Failed("owner_journal_shutting_down".into()));
             }
-            CallState::Submit { .. } => {
+            CallState::Submit { attempted } => {
                 pending.state = CallState::Submit { attempted: true };
-                match send(Command::Request {
-                    service: STATE.into(),
-                    payload: pending.payload.clone(),
-                    timeout_ms: TIMEOUT_MS,
-                    operation_id: pending.operation_id.clone(),
-                    parent: None,
-                }) {
+                let command = if attempted {
+                    Command::LookupRequest {
+                        service: STATE.into(),
+                        payload: pending.payload.clone(),
+                        operation_id: pending.operation_id.clone(),
+                        parent: None,
+                    }
+                } else {
+                    pending.first_sent = Some(Instant::now());
+                    Command::Request {
+                        service: STATE.into(),
+                        payload: pending.payload.clone(),
+                        timeout_ms: TIMEOUT_MS,
+                        operation_id: pending.operation_id.clone(),
+                        parent: None,
+                    }
+                };
+                match send(command) {
                     Ok(Response::Accepted { id }) => {
-                        pending.state = if self.shutting_down {
+                        pending.state = if self.shutting_down
+                            && !matches!(pending.purpose, Purpose::Store { .. })
+                        {
                             CallState::Cancelling(id)
                         } else {
                             CallState::Waiting(id)
                         }
                     }
-                    Ok(Response::Error { code, message }) => {
+                    Ok(Response::Error { code, message }) if !attempted && code != "conflict" => {
                         finished = Some(Outcome::Failed(format!("{code}: {message}")))
+                    }
+                    Ok(Response::Error { code, .. }) if !attempted && code == "conflict" => {
+                        // The existing operation's age cannot be established.
+                        pending.first_sent = None;
+                    }
+                    Ok(Response::Error { code, .. })
+                        if attempted
+                            && code == "not_found"
+                            && pending
+                                .first_sent
+                                .is_some_and(|first| first.elapsed() < LOOKUP_RETENTION) =>
+                    {
+                        finished = Some(Outcome::Failed("owner_journal_not_admitted".into()));
                     }
                     Ok(_) | Err(_) => {}
                 }
             }
-            CallState::Waiting(request) if self.shutting_down => {
+            CallState::Waiting(request)
+                if self.shutting_down && !matches!(pending.purpose, Purpose::Store { .. }) =>
+            {
                 pending.state = CallState::Cancelling(request)
             }
             CallState::Waiting(request) => {
@@ -177,11 +210,15 @@ impl OwnerJournal {
                             outcome: Outcome::Payload(payload),
                         }
                     }
-                    Ok(Response::Error { code, message }) if code == "not_found" => {
+                    Ok(Response::Error { code, message })
+                        if !matches!(pending.purpose, Purpose::Store { .. })
+                            && code == "not_found" =>
+                    {
                         finished = Some(Outcome::Failed(format!("{code}: {message}")))
                     }
                     Ok(Response::Error { code, message })
-                        if matches!(code.as_str(), "cancelled" | "deadline_exceeded") =>
+                        if !matches!(pending.purpose, Purpose::Store { .. })
+                            && matches!(code.as_str(), "cancelled" | "deadline_exceeded") =>
                     {
                         pending.state = CallState::Releasing {
                             request,
@@ -278,6 +315,7 @@ impl OwnerJournal {
                             payload: json!({"action":"get","key":KEY}),
                             operation_id: self.next_operation_id("verify")?,
                             state: CallState::Submit { attempted: false },
+                            first_sent: None,
                         });
                     }
                     Outcome::Payload(payload) => self.store_failed(state_error(&payload))?,
@@ -318,6 +356,7 @@ impl OwnerJournal {
             payload: json!({"action":"get","key":KEY}),
             operation_id: self.next_operation_id("reload")?,
             state: CallState::Submit { attempted: false },
+            first_sent: None,
         });
         Ok(())
     }

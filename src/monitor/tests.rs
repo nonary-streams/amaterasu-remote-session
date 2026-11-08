@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 struct Provider {
     calls: BTreeMap<u64, Value>,
     operations: BTreeMap<String, u64>,
+    requests: BTreeMap<String, (String, Value, Option<u64>)>,
+    lookups: usize,
     next: u64,
     specification: Option<Value>,
     references: BTreeSet<String>,
@@ -43,6 +45,8 @@ impl Default for Provider {
         Self {
             calls: BTreeMap::new(),
             operations: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            lookups: 0,
             next: 0,
             specification: None,
             references: BTreeSet::new(),
@@ -85,6 +89,7 @@ impl Provider {
                 service,
                 payload,
                 operation_id,
+                parent,
                 ..
             } => {
                 if let Some(id) = self.operations.get(&operation_id) {
@@ -92,6 +97,10 @@ impl Provider {
                 }
                 self.next += 1;
                 let id = self.next;
+                self.requests.insert(
+                    operation_id.clone(),
+                    (service.clone(), payload.clone(), parent),
+                );
                 self.operations.insert(operation_id, id);
                 let result = if service == "amaterasu.video/1" {
                     self.preflight(&payload)
@@ -107,6 +116,28 @@ impl Provider {
                     return Err("lost admission after commit".into());
                 }
                 Ok(Response::Accepted { id })
+            }
+            Command::LookupRequest {
+                service,
+                payload,
+                operation_id,
+                parent,
+            } => {
+                self.lookups += 1;
+                match (
+                    self.operations.get(&operation_id),
+                    self.requests.get(&operation_id),
+                ) {
+                    (Some(id), Some((previous_service, previous_payload, previous_parent)))
+                        if previous_service == &service
+                            && previous_payload == &payload
+                            && previous_parent == &parent =>
+                    {
+                        Ok(Response::Accepted { id: *id })
+                    }
+                    (Some(_), _) => Ok(Response::error("conflict", "operation differs")),
+                    _ => Ok(Response::error("not_found", "operation not admitted")),
+                }
             }
             Command::TakeResult { request } => {
                 if self.lose_scope_result
@@ -132,6 +163,8 @@ impl Provider {
                     return Err("lost release reply".into());
                 }
                 self.calls.remove(&request);
+                self.requests
+                    .retain(|operation, _| self.operations.get(operation) != Some(&request));
                 self.operations.retain(|_, id| *id != request);
                 self.released += 1;
                 Ok(Response::Ok)
@@ -662,7 +695,7 @@ fn admission_is_not_readiness_and_exact_target_is_required() {
 }
 
 #[test]
-fn a_lost_admission_reuses_the_exact_operation_and_releases_every_result() {
+fn a_lost_admission_looks_up_the_exact_operation_and_releases_every_result() {
     let now = Instant::now();
     let mut manager = MonitorManager::new(MonitorSettings::default());
     let mut provider = Provider {
@@ -681,6 +714,7 @@ fn a_lost_admission_reuses_the_exact_operation_and_releases_every_result() {
     );
     assert!(provider.calls.is_empty());
     assert_eq!(provider.released, provider.observed.len());
+    assert!(provider.lookups > 0);
 }
 
 #[test]
@@ -825,6 +859,113 @@ fn request_timeout_retires_broker_request_before_provider_reconciliation() {
 }
 
 #[test]
+fn lost_mutation_admission_is_looked_up_without_replay() {
+    let now = Instant::now();
+    let mut call = Call::new(
+        SERVICE,
+        json!({"action":"remove"}),
+        "unique-operation".into(),
+        now,
+        false,
+    );
+    let mut seen = Vec::new();
+    assert!(
+        call.poll(now, &mut |command| {
+            seen.push(command);
+            Err("reply lost".into())
+        })
+        .is_none()
+    );
+    assert!(call.effect_unconfirmed);
+    let result = call.poll(now, &mut |command| {
+        seen.push(command);
+        Ok(Response::error("not_found", "not admitted"))
+    });
+    assert_eq!(result, Some(Err("monitor_request_not_admitted".into())));
+    assert!(matches!(
+        seen.as_slice(),
+        [Command::Request { .. }, Command::LookupRequest { .. }]
+    ));
+}
+
+#[test]
+fn mutation_timeout_and_broker_error_never_retire_or_cancel_effect() {
+    let now = Instant::now();
+    let mut call = Call::new(
+        SERVICE,
+        json!({"action":"create"}),
+        "unique-operation".into(),
+        now,
+        false,
+    );
+    assert!(
+        call.poll(now, &mut |_| Ok(Response::Accepted { id: 42 }))
+            .is_none()
+    );
+    let expired = now + REQUEST_TIMEOUT;
+    for _ in 0..3 {
+        assert!(
+            call.poll(expired, &mut |command| {
+                assert!(matches!(command, Command::TakeResult { request: 42 }));
+                Ok(Response::error("deadline_exceeded", "unknown effect"))
+            })
+            .is_none()
+        );
+    }
+    assert!(call.effect_unconfirmed);
+    assert!(
+        call.poll(expired, &mut |_| Ok(Response::Result {
+            payload: json!({"ok":true})
+        }))
+        .is_none()
+    );
+    assert_eq!(
+        call.poll(expired, &mut |command| {
+            assert!(matches!(command, Command::ReleaseResult { request: 42 }));
+            Ok(Response::Ok)
+        }),
+        Some(Ok(json!({"ok":true})))
+    );
+}
+
+#[test]
+fn late_or_conflicting_lookup_cannot_prove_mutation_absence() {
+    let now = Instant::now();
+    for conflict in [false, true] {
+        let mut call = Call::new(
+            SERVICE,
+            json!({"action":"remove"}),
+            "unique-operation".into(),
+            now,
+            false,
+        );
+        assert!(
+            call.poll(now, &mut |_| if conflict {
+                Ok(Response::error("conflict", "older operation"))
+            } else {
+                Err("lost admission".into())
+            })
+            .is_none()
+        );
+        let later = if conflict {
+            now
+        } else {
+            now + BROKER_RETENTION
+        };
+        for _ in 0..2 {
+            assert!(
+                call.poll(later, &mut |command| {
+                    assert!(matches!(command, Command::LookupRequest { .. }));
+                    Ok(Response::error("not_found", "not admitted"))
+                })
+                .is_none()
+            );
+        }
+        assert!(call.effect_unconfirmed);
+    }
+}
+
+#[test]
 fn routine_status_polling_releases_more_than_the_broker_ledger_capacity() {
     let now = Instant::now();
     let mut manager = MonitorManager::new(MonitorSettings::default());
@@ -961,7 +1102,18 @@ fn uncertain_scoped_completion_reconciles_the_same_native_operation() {
     manager.begin("alice", 3, request(), now).unwrap();
     tick(&mut manager, &mut provider, now);
     provider.state = "ready";
-    tick(&mut manager, &mut provider, now + RETRY_INTERVAL);
+    for _ in 0..48 {
+        manager
+            .tick(now + RETRY_INTERVAL, &mut |command| provider.send(command))
+            .unwrap();
+        if manager.monitors["alice"]
+            .call
+            .as_ref()
+            .is_some_and(|call| call.effect_unconfirmed)
+        {
+            break;
+        }
+    }
     assert!(!manager.snapshot("alice").unwrap().ready);
     tick(&mut manager, &mut provider, now + RETRY_INTERVAL * 2);
     assert!(manager.snapshot("alice").unwrap().ready);
@@ -970,8 +1122,11 @@ fn uncertain_scoped_completion_reconciles_the_same_native_operation() {
         .iter()
         .filter(|operation| operation["action"] == "scoped_apply")
         .collect::<Vec<_>>();
-    assert_eq!(operations.len(), 2);
-    assert_eq!(operations[0], operations[1]);
+    assert_eq!(
+        operations.len(),
+        1,
+        "a lost result must not resubmit a mutation"
+    );
     assert!(provider.calls.is_empty());
 }
 

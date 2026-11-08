@@ -29,10 +29,7 @@ use recovery::{Membership, Recovery};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use settings::{ProductSettings, Settings};
-use std::{
-    collections::BTreeSet,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeSet, time::Instant};
 
 const PUBLIC_SERVICE: &str = "nonary.remote-session/1";
 const MANAGEMENT: &str = "amaterasu.management";
@@ -91,14 +88,10 @@ impl ManagedModule for RemoteSessionModule {
             // service registration creates an unrestricted operation endpoint.
             runtime.require_success(Command::RegisterApi { method })?;
         }
-        let startup_id = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let mut startup_nonce = [0_u8; 16];
+        getrandom::fill(&mut startup_nonce)
+            .map_err(|error| format!("remote-session operation identity unavailable: {error}"))?;
+        let startup_id = format!("{:032x}", u128::from_le_bytes(startup_nonce));
         let now = Instant::now();
         Ok(Self {
             runtime,

@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BROKER_RETENTION: Duration = Duration::from_secs(300);
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CLIENT_HISTORY: usize = 128;
@@ -409,6 +410,17 @@ impl Monitor {
                 self.instance_nonce, self.identity, self.generation
             ),
             now,
+            matches!(
+                self.step,
+                Step::Inspect
+                    | Step::VerifyRemove
+                    | Step::InspectSource
+                    | Step::VerifySourceRemove
+                    | Step::CompositionSnapshot
+                    | Step::ModeSnapshot
+                    | Step::CompositionStatus
+                    | Step::ExistingPreflight
+            ),
         ));
         Ok(())
     }
@@ -768,6 +780,10 @@ impl Monitor {
                 && self.captures.is_empty()
                 && self.display_target.is_some()
             {
+                // No new source reservation may be handed out while an
+                // eligible topology change is being planned or applied.
+                self.ready = false;
+                self.source_ready = false;
                 self.schedule(Step::CompositionSnapshot, now, Duration::ZERO);
                 return;
             }
@@ -1318,6 +1334,16 @@ impl MonitorManager {
             .filter(|monitor| monitor.generation == generation)
         {
             monitor.captures.remove(transport_id);
+            if monitor.captures.is_empty()
+                && monitor.composition_dirty
+                && !monitor.release_requested
+            {
+                // A previously deferred layout can now run; close source
+                // admission before another caller can borrow the old mode.
+                monitor.ready = false;
+                monitor.source_ready = false;
+                monitor.next_poll = now;
+            }
             if monitor.release_requested && monitor.captures.is_empty() && monitor.call.is_none() {
                 monitor.schedule(
                     if monitor.reference_released {
@@ -1345,8 +1371,9 @@ impl MonitorManager {
             monitor.layout_rules = self.layout.clone();
             monitor.composition_dirty = true;
             monitor.effect_stalled = false;
-            if !monitor.release_requested && monitor.captures.is_empty() && monitor.call.is_none() {
+            if !monitor.release_requested && monitor.captures.is_empty() {
                 monitor.ready = false;
+                monitor.source_ready = false;
                 monitor.next_poll = Instant::now();
             }
         }
@@ -1475,6 +1502,18 @@ impl MonitorManager {
                 .as_mut()
                 .expect("queued monitor call")
                 .poll(now, send);
+            if monitor
+                .call
+                .as_ref()
+                .is_some_and(|call| call.effect_unconfirmed)
+            {
+                // A potentially delivered mutation must not leave the old
+                // source advertised as ready while its outcome is unknown.
+                monitor.ready = false;
+                monitor.source_ready = false;
+                monitor.output = None;
+                monitor.error = Some("monitor_effect_unconfirmed".into());
+            }
             if let Some(result) = outcome {
                 monitor.call = None;
                 monitor.accept(result, now);
@@ -1491,10 +1530,20 @@ struct Call {
     deadline: Instant,
     result: Option<Result<Value, String>>,
     cancelled: bool,
+    read_only: bool,
+    attempted: bool,
+    first_sent: Option<Instant>,
+    effect_unconfirmed: bool,
 }
 
 impl Call {
-    fn new(service: &str, payload: Value, operation_id: String, now: Instant) -> Self {
+    fn new(
+        service: &str,
+        payload: Value,
+        operation_id: String,
+        now: Instant,
+        read_only: bool,
+    ) -> Self {
         Self {
             command: Command::Request {
                 service: service.into(),
@@ -1507,6 +1556,10 @@ impl Call {
             deadline: now + REQUEST_TIMEOUT,
             result: None,
             cancelled: false,
+            read_only,
+            attempted: false,
+            first_sent: None,
+            effect_unconfirmed: false,
         }
     }
 
@@ -1516,12 +1569,51 @@ impl Call {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Option<Result<Value, String>> {
         let Some(request) = self.request else {
-            // A lost admission may have committed. Retry the identical command,
-            // including operation ID, until its broker request can be retired.
-            match send(self.command.clone()) {
+            let attempted = self.attempted;
+            let command = if attempted {
+                let Command::Request {
+                    service,
+                    payload,
+                    operation_id,
+                    parent,
+                    ..
+                } = &self.command
+                else {
+                    unreachable!("monitor submits ordinary requests")
+                };
+                Command::LookupRequest {
+                    service: service.clone(),
+                    payload: payload.clone(),
+                    operation_id: operation_id.clone(),
+                    parent: *parent,
+                }
+            } else {
+                self.attempted = true;
+                self.first_sent = Some(now.min(Instant::now()));
+                self.command.clone()
+            };
+            match send(command) {
                 Ok(Response::Accepted { id }) => self.request = Some(id),
-                Ok(Response::Error { code, .. }) => return Some(Err(code)),
-                _ => {}
+                Ok(Response::Error { code, .. }) if !attempted && code != "conflict" => {
+                    return Some(Err(code));
+                }
+                Ok(Response::Error { code, .. }) if !attempted && code == "conflict" => {
+                    // A pre-existing conflicting identity has an unknown age.
+                    self.first_sent = None;
+                    self.effect_unconfirmed = !self.read_only;
+                }
+                Ok(Response::Error { code, .. })
+                    if attempted
+                        && code == "not_found"
+                        && self.first_sent.is_some_and(|first| {
+                            now.max(Instant::now())
+                                .checked_duration_since(first)
+                                .is_some_and(|age| age < BROKER_RETENTION)
+                        }) =>
+                {
+                    return Some(Err("monitor_request_not_admitted".into()));
+                }
+                _ => self.effect_unconfirmed = !self.read_only,
             }
             return None;
         };
@@ -1532,7 +1624,7 @@ impl Call {
                 _ => None,
             };
         }
-        if now >= self.deadline || self.cancelled {
+        if self.read_only && (now >= self.deadline || self.cancelled) {
             self.cancelled = true;
             if settled(send(Command::Cancel { request })) {
                 self.result = Some(Err("monitor_request_cancelled".into()));
@@ -1540,13 +1632,22 @@ impl Call {
             return None;
         }
         match send(Command::TakeResult { request }) {
-            Ok(Response::Pending) => None,
+            Ok(Response::Pending) => {
+                if !self.read_only && now >= self.deadline {
+                    self.effect_unconfirmed = true;
+                }
+                None
+            }
             Ok(Response::Result { payload }) => {
                 self.result = Some(Ok(payload));
                 None
             }
-            _ => {
+            _ if self.read_only => {
                 self.cancelled = true;
+                None
+            }
+            _ => {
+                self.effect_unconfirmed = true;
                 None
             }
         }

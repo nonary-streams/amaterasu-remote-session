@@ -119,6 +119,23 @@ impl Backend {
                     payload: self.calls[&request].result.clone().unwrap(),
                 })
             }
+            Command::LookupRequest {
+                service,
+                payload,
+                operation_id,
+                parent,
+            } => {
+                assert_eq!(service, STATE);
+                assert_eq!(parent, None);
+                Ok(self
+                    .calls
+                    .iter()
+                    .find_map(|(id, call)| {
+                        (call.operation_id == operation_id && call.payload == payload)
+                            .then_some(Response::Accepted { id: *id })
+                    })
+                    .unwrap_or_else(|| Response::error("not_found", "not admitted")))
+            }
             Command::ReleaseResult { request } => {
                 let Some(call) = self.calls.get(&request) else {
                     return Ok(Response::error("not_found", "retired"));
@@ -278,14 +295,13 @@ fn lost_admission_result_and_release_replies_never_duplicate_a_state_mutation() 
     let stored = backend.state(json!({"action":"get","key":KEY}));
     assert_eq!(stored["revision"], 1);
     assert_eq!(stored["value"], desired);
-    assert_eq!(backend.submissions[0], backend.submissions[1]);
     assert_eq!(
         backend
             .submissions
             .iter()
             .filter(|(_, payload)| payload["action"] == "set")
             .count(),
-        2
+        1
     );
     assert!(backend.calls.is_empty());
 }
@@ -434,5 +450,120 @@ fn quiesce_recovers_unknown_call_ids_and_does_not_report_retirement_early() {
     assert!(backend.calls.is_empty());
     assert!(!journal.is_ready());
     assert!(journal.take_completion().is_none());
-    assert_eq!(backend.submissions[0], backend.submissions[1]);
+    assert_eq!(backend.submissions.len(), 1);
+}
+
+#[test]
+fn shutdown_does_not_replay_or_cancel_an_uncertain_journal_write() {
+    let mut backend = Backend::new();
+    let mut journal = OwnerJournal::new("shutdown-write");
+    backend.load(&mut journal);
+    backend.submissions.clear();
+    backend.lose_admission = true;
+    let desired = document(1);
+    journal.begin_store(desired.clone()).unwrap();
+    journal
+        .advance(&mut |command| backend.send(command))
+        .unwrap();
+    let mut commands = Vec::new();
+    for _ in 0..10 {
+        if journal
+            .quiesce(&mut |command| {
+                commands.push(command.clone());
+                backend.send(command)
+            })
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert!(journal.pending.is_none());
+    assert!(journal.take_completion().is_none());
+    assert!(!journal.is_ready());
+    assert_eq!(
+        backend.state(json!({"action":"get","key":KEY}))["value"],
+        desired
+    );
+    assert_eq!(backend.submissions.len(), 1);
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, Command::LookupRequest { .. }))
+    );
+    assert!(
+        commands
+            .iter()
+            .all(|command| !matches!(command, Command::Request { .. } | Command::Cancel { .. }))
+    );
+}
+
+#[test]
+fn shutdown_fences_a_write_when_broker_timeout_does_not_prove_completion() {
+    let mut backend = Backend::new();
+    let mut journal = OwnerJournal::new("timeout-write");
+    backend.load(&mut journal);
+    journal.begin_store(document(1)).unwrap();
+    journal
+        .advance(&mut |command| backend.send(command))
+        .unwrap();
+    for _ in 0..3 {
+        assert!(
+            !journal
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::TakeResult { .. }));
+                    Ok(Response::error(
+                        "deadline_exceeded",
+                        "provider outcome unconfirmed",
+                    ))
+                })
+                .unwrap()
+        );
+    }
+    assert!(journal.pending.is_some());
+    assert!(journal.take_completion().is_none());
+}
+
+#[test]
+fn normal_broker_timeout_does_not_reload_over_an_unconfirmed_write() {
+    let mut backend = Backend::new();
+    let mut journal = OwnerJournal::new("normal-timeout-write");
+    backend.load(&mut journal);
+    journal.begin_store(document(1)).unwrap();
+    journal
+        .advance(&mut |command| backend.send(command))
+        .unwrap();
+    for _ in 0..3 {
+        journal
+            .advance(&mut |command| {
+                assert!(matches!(command, Command::TakeResult { .. }));
+                Ok(Response::error(
+                    "deadline_exceeded",
+                    "provider outcome unconfirmed",
+                ))
+            })
+            .unwrap();
+    }
+    assert!(!journal.is_ready());
+    assert_eq!(journal.snapshot(), &empty_document());
+    assert!(journal.pending.is_some());
+    assert!(journal.take_completion().is_none());
+}
+
+#[test]
+fn lookup_absence_only_retires_within_the_broker_retention_window() {
+    for (age, expected) in [(Duration::from_secs(1), true), (LOOKUP_RETENTION, false)] {
+        let mut journal = OwnerJournal::new("lookup-window");
+        let pending = journal.pending.as_mut().unwrap();
+        pending.state = CallState::Submit { attempted: true };
+        pending.first_sent = Some(Instant::now() - age);
+        assert_eq!(
+            journal
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::LookupRequest { .. }));
+                    Ok(Response::error("not_found", "not admitted"))
+                })
+                .unwrap(),
+            expected
+        );
+    }
 }

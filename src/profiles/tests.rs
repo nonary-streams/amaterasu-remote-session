@@ -81,6 +81,15 @@ impl Host {
                     Command::TakeResult { request } => Response::Result {
                         payload: self.results[&request].clone(),
                     },
+                    Command::LookupRequest { operation_id, .. } => {
+                        if self.commands.iter().any(|command| matches!(command,
+                            Command::Request { operation_id: previous, .. } if previous == &operation_id
+                        )) && self.results.contains_key(&self.next) {
+                            Response::Accepted { id: self.next }
+                        } else {
+                            Response::error("not_found", "not admitted")
+                        }
+                    }
                     Command::ReleaseResult { .. } if self.fail_release => {
                         return Err("release unavailable".into());
                     }
@@ -298,7 +307,7 @@ fn target_inventory_uses_the_selected_display_contract_and_parent_authority() {
 }
 
 #[test]
-fn lost_admission_retries_exact_payload_and_quiesce_waits_for_release() {
+fn lost_admission_uses_lookup_and_quiesce_waits_for_release() {
     let mut manager = ProfileManager::new("startup");
     manager
         .handle(10, "amaterasu.management", json!({"action":"profiles_get"}))
@@ -323,8 +332,11 @@ fn lost_admission_retries_exact_payload_and_quiesce_waits_for_release() {
             _ => None,
         })
         .collect();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests.len(), 1);
+    assert!(host.commands.iter().any(|command| matches!(command,
+        Command::LookupRequest { payload, operation_id, parent: Some(10), .. }
+        if (payload.clone(), operation_id.clone()) == requests[0]
+    )));
     manager.shutting_down = true;
     host.fail_release = true;
     for _ in 0..4 {
@@ -364,6 +376,130 @@ fn cancelled_parent_cannot_start_a_catalog_mutation() {
             .any(|command| matches!(command, Command::Request { .. }))
     );
     assert!(manager.take_completion().is_none());
+}
+
+#[test]
+fn abandoned_mutation_waits_for_provider_result_and_release() {
+    let mut manager = ProfileManager::new("startup");
+    manager
+        .handle(
+            10,
+            "amaterasu.management",
+            json!({
+                "action":"profile_delete","id":"app-0000000000000001","expected_revision":3
+            }),
+        )
+        .unwrap();
+    manager
+        .tick(&mut |command| match command {
+            Command::CheckRequest { .. } => Ok(Response::Ok),
+            Command::Request { .. } => Ok(Response::Accepted { id: 9 }),
+            _ => panic!("unexpected command"),
+        })
+        .unwrap();
+    manager
+        .tick(&mut |command| match command {
+            Command::CheckRequest { .. } => Ok(Response::error("request_ended", "expired")),
+            Command::TakeResult { request: 9 } => {
+                Ok(Response::error("deadline_exceeded", "unknown"))
+            }
+            _ => panic!("must not cancel or release an uncertain mutation"),
+        })
+        .unwrap();
+    assert!(manager.active.is_some());
+    assert!(!manager.quiesce(&mut |command| match command {
+        Command::TakeResult { request: 9 } => Ok(Response::Result {
+            payload: json!({"ok":true,"id":"app-0000000000000001","deleted":true,"revision":4}),
+        }),
+        _ => panic!("unexpected command"),
+    }).unwrap());
+    assert!(
+        !manager
+            .quiesce(&mut |command| match command {
+                Command::ReleaseResult { request: 9 } => Err("lost release".into()),
+                _ => panic!("unexpected command"),
+            })
+            .unwrap()
+    );
+    assert!(
+        manager
+            .quiesce(&mut |command| match command {
+                Command::ReleaseResult { request: 9 } =>
+                    Ok(Response::error("not_found", "already released")),
+                _ => panic!("unexpected command"),
+            })
+            .unwrap()
+    );
+    assert!(manager.take_completion().is_none());
+}
+
+#[test]
+fn uncertain_mutation_uses_bounded_lookup_without_replaying() {
+    for expired in [false, true] {
+        let mut manager = ProfileManager::new("startup");
+        manager
+            .handle(
+                10,
+                "amaterasu.management",
+                json!({
+                    "action":"profile_delete","id":"app-0000000000000001","expected_revision":3
+                }),
+            )
+            .unwrap();
+        manager
+            .tick(&mut |command| match command {
+                Command::CheckRequest { .. } => Ok(Response::Ok),
+                Command::Request { .. } => Err("lost admission".into()),
+                _ => panic!("unexpected command"),
+            })
+            .unwrap();
+        if expired {
+            let Some(Pending {
+                call: Call::Lookup { first_sent },
+                ..
+            }) = manager.active.as_mut()
+            else {
+                panic!("missing uncertain admission");
+            };
+            *first_sent = Some(Instant::now() - REQUEST_RETENTION);
+        }
+        let ready = manager
+            .quiesce(&mut |command| match command {
+                Command::LookupRequest {
+                    parent: Some(10), ..
+                } => Ok(Response::error("not_found", "no record")),
+                _ => panic!("uncertain admission must not be replayed"),
+            })
+            .unwrap();
+        assert_eq!(ready, !expired);
+    }
+}
+
+#[test]
+fn conflicting_mutation_identity_remains_fenced_even_if_lookup_is_missing() {
+    let mut manager = ProfileManager::new("startup");
+    manager
+        .handle(
+            10,
+            "amaterasu.management",
+            json!({"action":"profile_delete","id":"app-0000000000000001","expected_revision":3}),
+        )
+        .unwrap();
+    manager
+        .tick(&mut |command| match command {
+            Command::CheckRequest { .. } => Ok(Response::Ok),
+            Command::Request { .. } => Ok(Response::error("conflict", "existing operation")),
+            _ => panic!("unexpected command"),
+        })
+        .unwrap();
+    assert!(
+        !manager
+            .quiesce(&mut |command| match command {
+                Command::LookupRequest { .. } => Ok(Response::error("not_found", "missing")),
+                _ => panic!("unexpected command"),
+            })
+            .unwrap()
+    );
 }
 
 #[test]

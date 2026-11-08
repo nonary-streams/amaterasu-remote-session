@@ -70,6 +70,24 @@ impl Configuration {
                     Ok(Response::Accepted { id: self.next })
                 }
             }
+            Command::LookupRequest {
+                service,
+                payload,
+                operation_id,
+                parent,
+            } => {
+                assert_eq!(service, CONFIGURATION);
+                Ok(self
+                    .calls
+                    .iter()
+                    .find_map(|(id, call)| {
+                        (call.operation_id == operation_id
+                            && call.payload == payload
+                            && call.parent == parent)
+                            .then_some(Response::Accepted { id: *id })
+                    })
+                    .unwrap_or_else(|| Response::error("not_found", "not admitted")))
+            }
             Command::TakeResult { request } => {
                 if !self.calls.contains_key(&request) {
                     return Ok(Response::error("not_found", "retired"));
@@ -244,9 +262,16 @@ fn lost_admission_and_release_replies_reuse_identity_and_retire_once() {
         ..ProductSettings::default()
     };
     store.begin_update(88, 0, desired).unwrap();
+    store
+        .advance(&mut |command| configuration.send(command))
+        .unwrap();
+    assert!(
+        !store.is_ready(),
+        "lost write admission must fence stale policy"
+    );
     assert_eq!(configuration.finish_update(&mut store)["ok"], true);
-    assert_eq!(configuration.submissions.len(), 2);
-    assert_eq!(configuration.submissions[0], configuration.submissions[1]);
+    assert!(store.is_ready());
+    assert_eq!(configuration.submissions.len(), 1);
     assert_eq!(
         configuration.document.as_ref().unwrap().1,
         1,
@@ -290,7 +315,7 @@ fn ended_parent_does_not_submit_new_mutation_and_unknown_admission_is_recovered(
         "request_ended"
     );
     assert!(configuration.calls.is_empty());
-    assert!(configuration.document.is_none());
+    assert!(configuration.document.is_some());
 }
 
 #[test]
@@ -432,8 +457,112 @@ fn shutdown_recovers_unknown_admission_and_retires_it_before_reporting_quiescenc
     assert!(!store.is_ready());
     assert!(store.take_completion().is_none());
     assert!(configuration.calls.is_empty());
-    assert_eq!(configuration.submissions.len(), 2);
-    assert_eq!(configuration.submissions[0], configuration.submissions[1]);
+    assert_eq!(configuration.submissions.len(), 1);
+}
+
+#[test]
+fn shutdown_retires_a_settled_update_only_after_queuing_its_completion() {
+    let mut store = ProductSettingsStore::new("shutdown-update", ProductSettings::default());
+    let mut configuration = Configuration {
+        management_active: true,
+        ..Default::default()
+    };
+    configuration.load(&mut store);
+    let desired = ProductSettings {
+        max_clients: 3,
+        ..ProductSettings::default()
+    };
+    store.begin_update(88, 0, desired.clone()).unwrap();
+    store
+        .advance(&mut |command| configuration.send(command))
+        .unwrap();
+
+    assert!(
+        !store
+            .quiesce(&mut |command| configuration.send(command))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .quiesce(&mut |command| configuration.send(command))
+            .unwrap()
+    );
+    assert_eq!(configuration.document, Some((desired.clone(), 1)));
+    assert!(configuration.calls.is_empty());
+    assert_eq!(store.settings(), (&desired, 1));
+
+    let (request, response) = store.take_completion().unwrap();
+    assert_eq!(request, 88);
+    assert_eq!(response["ok"], true);
+    assert!(
+        store
+            .quiesce(&mut |command| configuration.send(command))
+            .unwrap()
+    );
+}
+
+#[test]
+fn ended_parent_keeps_unconfirmed_write_fenced_without_replaying_or_cancelling() {
+    let mut store = ProductSettingsStore::new("write-fence", ProductSettings::default());
+    let mut configuration = Configuration {
+        management_active: true,
+        ..Default::default()
+    };
+    configuration.load(&mut store);
+    configuration.lose_admission = true;
+    store
+        .begin_update(88, 0, ProductSettings::default())
+        .unwrap();
+    store
+        .advance(&mut |command| configuration.send(command))
+        .unwrap();
+    assert_eq!(configuration.calls.len(), 1);
+    configuration.management_active = false;
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        assert!(
+            !store
+                .quiesce(&mut |command| {
+                    seen.push(command.clone());
+                    match command {
+                        Command::LookupRequest { .. } => Ok(Response::Accepted { id: 2 }),
+                        Command::TakeResult { request: 2 } => {
+                            Ok(Response::error("deadline_exceeded", "unconfirmed"))
+                        }
+                        _ => panic!("unexpected command: {command:?}"),
+                    }
+                })
+                .unwrap()
+        );
+    }
+    assert!(!store.is_ready());
+    assert!(
+        seen.iter()
+            .any(|command| matches!(command, Command::LookupRequest { .. }))
+    );
+    assert!(seen.iter().all(|command| !matches!(
+        command,
+        Command::Request { .. } | Command::Cancel { .. } | Command::ReleaseResult { .. }
+    )));
+}
+
+#[test]
+fn shutdown_lookup_absence_requires_the_broker_retention_window() {
+    for (age, expected) in [(Duration::from_secs(1), true), (LOOKUP_RETENTION, false)] {
+        let mut store = ProductSettingsStore::new("lookup-window", ProductSettings::default());
+        let pending = store.pending.as_mut().unwrap();
+        pending.state = CallState::Submit { attempted: true };
+        pending.first_sent = Some(Instant::now() - age);
+        assert_eq!(
+            store
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::LookupRequest { .. }));
+                    Ok(Response::error("not_found", "not admitted"))
+                })
+                .unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
