@@ -176,3 +176,12 @@ installed service or publisher key.
 
 Licensed under [MIT](LICENSE). [Source provenance](PROVENANCE.md) records the
 history-preserving extraction and exact originating feature commit.
+
+## Releases
+
+Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` builds the
+Linux and Windows libraries against the SDK commit in `sdk-revision`, attests
+where they were built, and publishes them as a GitHub release. A host installs
+this module as part of the signed Amaterasu Core set; a release here is not an
+installable package on its own. `metadata/module.json` describes the module and
+where the host mounts it.

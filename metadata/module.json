@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "family": "remote-session",
+  "repository": "https://github.com/nonary-streams/amaterasu-remote-session",
+  "mount": "modules/remote-session",
+  "components": [
+    {
+      "id": "amaterasu.remote-session",
+      "package": "amaterasu-remote-session",
+      "path": ".",
+      "name": "Remote session",
+      "summary": "Provides the remote monitor and remote input modes."
+    }
+  ]
+}
