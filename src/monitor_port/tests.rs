@@ -7,6 +7,7 @@ fn owner() -> RetainedOwner {
 }
 
 struct Video {
+    service: &'static str,
     request: Option<SourcePreflightRequest>,
     command: Option<Command>,
     ready: bool,
@@ -17,6 +18,7 @@ struct Video {
 impl Video {
     fn new(ready: bool) -> Self {
         Self {
+            service: "amaterasu.video/1",
             request: None,
             command: None,
             ready,
@@ -29,7 +31,7 @@ impl Video {
             Command::Request {
                 service, payload, ..
             } => {
-                assert_eq!(service, "amaterasu.video/1");
+                assert_eq!(service, self.service);
                 assert_eq!(payload["action"], "preflight_source");
                 self.actions
                     .push(payload["route_key"].as_str().unwrap().to_owned());
@@ -81,9 +83,29 @@ impl Video {
 }
 
 #[test]
+fn source_preflight_uses_the_selected_video_service() {
+    for service in ["amaterasu.video/1", "replacement.video/1"] {
+        let now = Instant::now();
+        let mut port = MonitorPort::new(&ProductSettings::default(), "selected", service);
+        port.authorize_sources(BTreeMap::from([("client".into(), true)]), true);
+        assert_eq!(
+            port.begin(&owner(), now).unwrap_err(),
+            "capture_source_preflight_pending"
+        );
+        let mut video = Video::new(true);
+        video.service = service;
+        for _ in 0..3 {
+            port.tick(now, &mut |command| video.send(command)).unwrap();
+        }
+        assert!(video.released);
+        port.begin(&owner(), now).unwrap();
+    }
+}
+
+#[test]
 fn missing_authority_and_pending_preflight_cannot_begin_a_native_monitor() {
     let now = Instant::now();
-    let mut port = MonitorPort::new(&ProductSettings::default(), "gate");
+    let mut port = MonitorPort::new(&ProductSettings::default(), "gate", "amaterasu.video/1");
     assert_eq!(
         port.begin(&owner(), now).unwrap_err(),
         "monitor_client_authority_pending"
@@ -114,7 +136,11 @@ fn missing_authority_and_pending_preflight_cannot_begin_a_native_monitor() {
 #[test]
 fn unsupported_capture_never_creates_a_display_and_reports_pending_application() {
     let now = Instant::now();
-    let mut port = MonitorPort::new(&ProductSettings::default(), "unsupported");
+    let mut port = MonitorPort::new(
+        &ProductSettings::default(),
+        "unsupported",
+        "amaterasu.video/1",
+    );
     port.authorize_sources(BTreeMap::from([("client".into(), true)]), true);
     assert!(port.begin(&owner(), now).is_err());
     let mut video = Video::new(false);
@@ -144,7 +170,7 @@ fn unsupported_capture_never_creates_a_display_and_reports_pending_application()
 #[test]
 fn existing_targets_preflight_the_desktop_route_without_inventing_a_selector() {
     let now = Instant::now();
-    let mut port = MonitorPort::new(&ProductSettings::default(), "existing");
+    let mut port = MonitorPort::new(&ProductSettings::default(), "existing", "amaterasu.video/1");
     port.authorize_sources(BTreeMap::from([("client".into(), true)]), true);
     let mut existing = owner();
     existing.mode.width = 64;
@@ -260,7 +286,11 @@ fn drain_absent_monitor(port: &mut MonitorPort, owner: &RetainedOwner, now: Inst
 #[test]
 fn persisted_invalid_monitor_mode_retires_without_authority_or_capture_preflight() {
     let now = Instant::now();
-    let mut port = MonitorPort::new(&ProductSettings::default(), "persisted-cleanup");
+    let mut port = MonitorPort::new(
+        &ProductSettings::default(),
+        "persisted-cleanup",
+        "amaterasu.video/1",
+    );
     let mut retiring = owner();
     retiring.mode.width = 64;
     retiring.mode.height = 48;
@@ -275,7 +305,11 @@ fn persisted_invalid_monitor_mode_retires_without_authority_or_capture_preflight
 #[test]
 fn rejected_small_monitor_can_start_exact_cleanup_from_its_frozen_proof() {
     let now = Instant::now();
-    let mut port = MonitorPort::new(&ProductSettings::default(), "rejected-cleanup");
+    let mut port = MonitorPort::new(
+        &ProductSettings::default(),
+        "rejected-cleanup",
+        "amaterasu.video/1",
+    );
     port.authorize_sources(BTreeMap::from([("client".into(), true)]), true);
     let mut rejected = owner();
     rejected.mode.width = 64;
@@ -296,7 +330,11 @@ fn rejected_small_monitor_can_start_exact_cleanup_from_its_frozen_proof() {
 #[test]
 fn temporary_authority_loss_keeps_existing_capture_capability_and_native_ownership() {
     let now = Instant::now();
-    let mut port = MonitorPort::new(&ProductSettings::default(), "authority");
+    let mut port = MonitorPort::new(
+        &ProductSettings::default(),
+        "authority",
+        "amaterasu.video/1",
+    );
     port.authorize_sources(BTreeMap::from([("client".into(), true)]), true);
     assert!(port.begin(&owner(), now).is_err());
     let mut video = Video::new(true);

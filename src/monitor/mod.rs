@@ -80,6 +80,7 @@ impl MonitorRequest {
 
 #[derive(Clone, Debug)]
 pub struct MonitorSettings {
+    pub video_service: String,
     pub disconnect_on_stream_end: bool,
     pub disconnect_on_client_disconnect: bool,
     pub max_monitors: usize,
@@ -88,6 +89,7 @@ pub struct MonitorSettings {
 impl Default for MonitorSettings {
     fn default() -> Self {
         Self {
+            video_service: "amaterasu.video/1".into(),
             disconnect_on_stream_end: false,
             disconnect_on_client_disconnect: false,
             max_monitors: 4,
@@ -153,6 +155,7 @@ enum Step {
 }
 
 struct Monitor {
+    video_service: String,
     instance_nonce: String,
     client_id: String,
     generation: u64,
@@ -286,6 +289,7 @@ impl Monitor {
                     .and_then(Value::as_i64)
                     .map(|scale| scale as i32),
                 virtual_display_layout: self.layout,
+                requested_resolution_only: false,
                 expected_topology_revision: None,
                 expected_topology_domain_id: None,
             },
@@ -343,7 +347,10 @@ impl Monitor {
             .ok_or("monitor_operation_id_exhausted")?;
         self.serial = serial;
         let (service, payload) = if self.step == Step::ExistingPreflight {
-            ("amaterasu.video/1", self.existing_preflight_payload()?)
+            (
+                self.video_service.as_str(),
+                self.existing_preflight_payload()?,
+            )
         } else if self.existing.is_some() {
             (
                 amaterasu_module_sdk::display::SERVICE,
@@ -1219,6 +1226,7 @@ impl MonitorManager {
         let reference = format!("remote-monitor-{identity}-{generation}");
         let source_reference = format!("remote-source-{identity}-{generation}");
         let monitor = Monitor {
+            video_service: self.settings.video_service.clone(),
             instance_nonce: self.instance_nonce.clone(),
             client_id: client.into(),
             generation,

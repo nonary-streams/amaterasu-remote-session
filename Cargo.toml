@@ -25,7 +25,7 @@ sha2 = "0.10"
 getrandom = "0.3"
 
 [dev-dependencies]
-amaterasu-state = { path = "../state", features = ["test-support"] }
+amaterasu-state = { package = "amaterasu-state-test-support", path = "../state/test-support" }
 amaterasu-runtime = { path = "../../crates/runtime" }
 
 [lints.rust]

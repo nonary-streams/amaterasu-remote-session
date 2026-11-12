@@ -83,6 +83,22 @@ impl ManagedModule for RemoteSessionModule {
         let startup: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid remote-session startup settings: {error}"))?;
         startup.validate()?;
+        let video_service = match runtime.processing_composition()? {
+            Some(composition) => {
+                let video = composition
+                    .frame_consumer
+                    .as_ref()
+                    .ok_or("video contract not selected")?;
+                amaterasu_module_sdk::processing_composition::require_contract(
+                    video,
+                    amaterasu_module_sdk::video::CONTRACT,
+                    1,
+                    0,
+                )?
+                .to_owned()
+            }
+            None => "amaterasu.video/1".into(),
+        };
         for method in presentation::methods().into_iter().chain(public_methods()) {
             // API registration selects the exact approved interface. No raw
             // service registration creates an unrestricted operation endpoint.
@@ -99,7 +115,7 @@ impl ManagedModule for RemoteSessionModule {
             profiles: ProfileManager::new(&startup_id),
             journal: OwnerJournal::new(&startup_id),
             policy: SessionPolicy::new(startup.product.clone()),
-            monitors: MonitorPort::new(&startup.product, &startup_id),
+            monitors: MonitorPort::new(&startup.product, &startup_id, &video_service),
             recovery: Recovery::new(&startup_id, now),
             startup,
             restored: false,

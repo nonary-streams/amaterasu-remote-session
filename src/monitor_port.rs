@@ -41,14 +41,15 @@ pub(crate) struct MonitorPort {
     proofs: BTreeMap<OwnerKey, SourceProof>,
     pending: Option<(OwnerKey, SourcePreflightRequest, &'static str, ReadOnlyCall)>,
     startup_id: String,
+    video_service: String,
     sequence: u64,
     shutting_down: bool,
 }
 
 impl MonitorPort {
-    pub(crate) fn new(settings: &ProductSettings, startup_id: &str) -> Self {
+    pub(crate) fn new(settings: &ProductSettings, startup_id: &str, video_service: &str) -> Self {
         Self {
-            manager: MonitorManager::new(monitor_settings(settings)),
+            manager: MonitorManager::new(monitor_settings(settings, video_service)),
             authorizations: BTreeMap::new(),
             authority_ready: false,
             proofs: BTreeMap::new(),
@@ -56,10 +57,12 @@ impl MonitorPort {
             sequence: 0,
             shutting_down: false,
             startup_id: startup_id.into(),
+            video_service: video_service.into(),
         }
     }
     pub(crate) fn apply_settings(&mut self, settings: &ProductSettings) {
-        self.manager.update_settings(monitor_settings(settings));
+        self.manager
+            .update_settings(monitor_settings(settings, &self.video_service));
     }
     pub(crate) fn authorize_sources(
         &mut self,
@@ -94,7 +97,7 @@ impl MonitorPort {
                 .checked_add(1)
                 .ok_or("capture preflight identity exhausted")?;
             let command = Command::Request {
-                service: "amaterasu.video/1".into(),
+                service: self.video_service.clone(),
                 payload: source_preflight_payload(proof.route_key, &proof.request)?,
                 timeout_ms: PREFLIGHT_TIMEOUT.as_millis() as u64,
                 operation_id: format!(
@@ -228,8 +231,9 @@ impl MonitorPort {
     }
 }
 
-fn monitor_settings(settings: &ProductSettings) -> MonitorSettings {
+fn monitor_settings(settings: &ProductSettings, video_service: &str) -> MonitorSettings {
     MonitorSettings {
+        video_service: video_service.into(),
         disconnect_on_stream_end: settings.remote_monitor_disconnect_on_stream_end,
         disconnect_on_client_disconnect: settings.remote_monitor_disconnect_on_client_disconnect,
         max_monitors: settings.max_clients,

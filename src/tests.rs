@@ -18,6 +18,7 @@ struct Outbound {
 
 struct Host {
     settings: Value,
+    composition: Option<Value>,
     methods: Vec<ApiMethod>,
     incoming: VecDeque<Response>,
     active: BTreeSet<u64>,
@@ -36,6 +37,7 @@ impl Default for Host {
     fn default() -> Self {
         Self {
             settings: json!({"allowed_principals":["wire"],"source_verifiers":["verifier"]}),
+            composition: None,
             methods: Vec::new(),
             incoming: VecDeque::new(),
             active: BTreeSet::new(),
@@ -69,6 +71,12 @@ impl Host {
         match command {
             Command::GetSettings {} => Response::Result {
                 payload: self.settings.clone(),
+            },
+            Command::GetProcessingComposition {} => match &self.composition {
+                Some(payload) => Response::Result {
+                    payload: payload.clone(),
+                },
+                None => Response::error("not_found", "no processing selection"),
             },
             Command::RegisterApi { method } => {
                 self.methods.push(method);
